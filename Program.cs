@@ -147,6 +147,7 @@ static async Task<int> RunUiAsync(string? udid)
 
     Console.CancelKeyPress += StopServer;
 
+    _ = MediaIndexStore.TriggerRefreshAsync(udid, includeAdditionalRoots: false);
     TryOpenBrowser(prefix);
     Console.WriteLine($"Media browser UI available at {prefix}");
     Console.WriteLine("Press Ctrl+C to stop.");
@@ -201,8 +202,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
         if (path == "/api/media" && context.Request.HttpMethod == "GET")
         {
             bool includeAdditionalRoots = IsTruthy(context.Request.QueryString["includeAdditionalRoots"]);
-            using AfcSession session = AfcSession.Connect(udid);
-            MediaEnumerationResult media = EnumerateMediaAssets(session.AfcClient, includeAdditionalRoots);
+            MediaEnumerationResult media = await MediaIndexStore.GetOrBuildAsync(udid, includeAdditionalRoots);
             IReadOnlyList<MediaAsset> assets = media.Assets;
 
             MediaLibraryResponse payload = new(
@@ -223,7 +223,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             string normalizedPath = NormalizeRemotePath(requestedPath);
 
             using AfcSession session = AfcSession.Connect(udid);
-            RemoteEntryInfo targetInfo = GetRemoteEntryInfo(session.AfcClient, normalizedPath);
+            RemoteEntryInfo targetInfo = GetRemoteEntryInfo(session.AfcClient, normalizedPath, udid);
             if (!targetInfo.IsDirectory)
             {
                 context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
@@ -231,13 +231,23 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                 return;
             }
 
-            RemoteFsEntry[] entries = ReadRemoteDirectoryEntries(session.AfcClient, normalizedPath)
-                .Select(entry =>
+            IReadOnlyList<string> directoryEntries = ReadRemoteDirectoryEntries(session.AfcClient, normalizedPath, udid);
+            ConcurrentBag<RemoteFsEntry> loadedEntries = [];
+            int metadataParallelism = Math.Max(2, Math.Min(8, Environment.ProcessorCount));
+            await Parallel.ForEachAsync(
+                directoryEntries,
+                new ParallelOptions { MaxDegreeOfParallelism = metadataParallelism },
+                (entry, _) =>
                 {
+                    using AfcSession workerSession = AfcSession.Connect(udid);
                     string childPath = CombineRemotePath(normalizedPath, entry);
-                    RemoteEntryInfo info = GetRemoteEntryInfo(session.AfcClient, childPath);
-                    return new RemoteFsEntry(entry, childPath, info.IsDirectory, info.IsFile, info.SizeBytes);
-                })
+                    RemoteEntryInfo info = GetRemoteEntryInfo(workerSession.AfcClient, childPath, udid);
+                    loadedEntries.Add(new RemoteFsEntry(entry, childPath, info.IsDirectory, info.IsFile, info.SizeBytes));
+                    return ValueTask.CompletedTask;
+                }
+            );
+
+            RemoteFsEntry[] entries = loadedEntries
                 .OrderByDescending(x => x.IsDirectory)
                 .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
@@ -356,7 +366,8 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                         {
                             progressTracker.MarkStarted(matchingWorkItem.ItemId);
                         }
-                        DeleteRemotePathRecursive(session.AfcClient, selectedPath);
+                        DeleteRemotePathRecursive(session.AfcClient, selectedPath, udid);
+                        AfcMetadataCache.InvalidatePath(udid, selectedPath);
                         if (matchingWorkItem is not null)
                         {
                             progressTracker.MarkProgress(matchingWorkItem.ItemId, 1, 1);
@@ -373,6 +384,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                     }
                 }
                 progressTracker.MarkCompleted();
+                MediaIndexStore.MarkDirty(udid);
 
                 AddToQueue(failures.Select(f => new QueuedTransferItem(
                     Guid.NewGuid().ToString(), f.RemoteFilePath, null, "delete", null, f.ErrorMessage, DateTimeOffset.UtcNow
@@ -390,8 +402,8 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             foreach (string selectedPath in selectedPaths)
             {
                 string selectionPath = NormalizeRemotePath(selectedPath);
-                RemoteEntryInfo info = GetRemoteEntryInfo(session.AfcClient, selectionPath);
-                IReadOnlyList<string> filePaths = EnumerateRemoteFilesForSelection(session.AfcClient, selectionPath, info);
+                RemoteEntryInfo info = GetRemoteEntryInfo(session.AfcClient, selectionPath, udid);
+                IReadOnlyList<string> filePaths = EnumerateRemoteFilesForSelection(session.AfcClient, selectionPath, info, udid);
 
                 foreach (string remoteFilePath in filePaths)
                 {
@@ -453,7 +465,8 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                     {
                         try
                         {
-                            DeleteRemotePathRecursive(session.AfcClient, selectedPath);
+                            DeleteRemotePathRecursive(session.AfcClient, selectedPath, udid);
+                            AfcMetadataCache.InvalidatePath(udid, selectedPath);
                         }
                         catch (Exception ex)
                         {
@@ -461,6 +474,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                         }
                     }
                 }
+                MediaIndexStore.MarkDirty(udid);
             }
             progressTracker.MarkCompleted();
 
@@ -503,7 +517,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             bool deleteAfterCopy = string.Equals(request.Operation, "move", StringComparison.OrdinalIgnoreCase);
 
             using AfcSession session = AfcSession.Connect(udid);
-            IReadOnlyList<MediaAsset> assets = EnumerateMediaAssets(session.AfcClient, request.IncludeAdditionalRoots).Assets;
+            IReadOnlyList<MediaAsset> assets = (await MediaIndexStore.GetOrBuildAsync(udid, request.IncludeAdditionalRoots)).Assets;
             Dictionary<string, MediaAsset> assetsById = assets.ToDictionary(x => x.Id, StringComparer.Ordinal);
 
             List<TransferCopyWorkItem> filesToCopy = [];
@@ -565,6 +579,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                     try
                     {
                         ThrowIfError(NativeMethods.afc_remove_path(session.AfcClient, remotePath), $"Unable to delete remote file '{remotePath}'");
+                        AfcMetadataCache.InvalidatePath(udid, remotePath);
                     }
                     catch (Exception ex)
                     {
@@ -572,6 +587,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                         progressTracker.MarkFailed(itemId, $"Delete after copy failed: {ex.Message}");
                     }
                 }
+                MediaIndexStore.MarkDirty(udid);
             }
             progressTracker.MarkCompleted();
 
@@ -644,7 +660,9 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
 
                     if (item.Operation == "delete")
                     {
-                        DeleteRemotePathRecursive(taskSession.AfcClient, item.RemoteFilePath);
+                        DeleteRemotePathRecursive(taskSession.AfcClient, item.RemoteFilePath, udid);
+                        AfcMetadataCache.InvalidatePath(udid, item.RemoteFilePath);
+                        MediaIndexStore.MarkDirty(udid);
                     }
                     else
                     {
@@ -660,6 +678,8 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                             if (!CryptographicOperations.FixedTimeEquals(sourceHash, localHash))
                                 throw new InvalidOperationException("SHA-256 mismatch. Remote source file was not deleted.");
                             ThrowIfError(NativeMethods.afc_remove_path(taskSession.AfcClient, item.RemoteFilePath), $"Unable to delete remote file '{item.RemoteFilePath}'");
+                            AfcMetadataCache.InvalidatePath(udid, item.RemoteFilePath);
+                            MediaIndexStore.MarkDirty(udid);
                         }
 
                         retriedPaths.Add(localPath);
@@ -894,7 +914,7 @@ static void ListRemoteDirectory(IntPtr afcClient, string remotePath)
     }
 }
 
-static MediaEnumerationResult EnumerateMediaAssets(IntPtr afcClient, bool includeAdditionalRoots)
+static MediaEnumerationResult EnumerateMediaAssets(IntPtr afcClient, bool includeAdditionalRoots, string? udid = null)
 {
     List<RemoteFileEntry> files = [];
     List<string> scannedRoots = [];
@@ -909,14 +929,14 @@ static MediaEnumerationResult EnumerateMediaAssets(IntPtr afcClient, bool includ
     {
         if (string.Equals(root, "DCIM", StringComparison.OrdinalIgnoreCase))
         {
-            EnumerateRemoteFiles(afcClient, root, files);
+            EnumerateRemoteFiles(afcClient, root, files, udid);
             scannedRoots.Add(root);
             continue;
         }
 
         try
         {
-            EnumerateRemoteFiles(afcClient, root, files);
+            EnumerateRemoteFiles(afcClient, root, files, udid);
             scannedRoots.Add(root);
         }
         catch (InvalidOperationException)
@@ -991,16 +1011,16 @@ static MediaEnumerationResult EnumerateMediaAssets(IntPtr afcClient, bool includ
     );
 }
 
-static void EnumerateRemoteFiles(IntPtr afcClient, string remoteDirectoryPath, List<RemoteFileEntry> files)
+static void EnumerateRemoteFiles(IntPtr afcClient, string remoteDirectoryPath, List<RemoteFileEntry> files, string? udid = null)
 {
-    foreach (string entry in ReadRemoteDirectoryEntries(afcClient, remoteDirectoryPath))
+    foreach (string entry in ReadRemoteDirectoryEntries(afcClient, remoteDirectoryPath, udid))
     {
         string childPath = CombineRemotePath(remoteDirectoryPath, entry);
-        RemoteEntryInfo info = GetRemoteEntryInfo(afcClient, childPath);
+        RemoteEntryInfo info = GetRemoteEntryInfo(afcClient, childPath, udid);
 
         if (info.IsDirectory)
         {
-            EnumerateRemoteFiles(afcClient, childPath, files);
+            EnumerateRemoteFiles(afcClient, childPath, files, udid);
             continue;
         }
 
@@ -1011,12 +1031,23 @@ static void EnumerateRemoteFiles(IntPtr afcClient, string remoteDirectoryPath, L
     }
 }
 
-static IReadOnlyList<string> ReadRemoteDirectoryEntries(IntPtr afcClient, string remotePath)
+static IReadOnlyList<string> ReadRemoteDirectoryEntries(IntPtr afcClient, string remotePath, string? udid = null, bool forceRefresh = false)
+{
+    string normalizedPath = NormalizeRemotePath(remotePath);
+    return AfcMetadataCache.GetDirectoryEntries(
+        udid,
+        normalizedPath,
+        () => ReadRemoteDirectoryEntriesRaw(afcClient, normalizedPath),
+        forceRefresh
+    );
+}
+
+static IReadOnlyList<string> ReadRemoteDirectoryEntriesRaw(IntPtr afcClient, string normalizedPath)
 {
     IntPtr directoryEntries = IntPtr.Zero;
     ThrowIfError(
-        NativeMethods.afc_read_directory(afcClient, remotePath, ref directoryEntries),
-        $"Unable to list remote directory '{remotePath}'"
+        NativeMethods.afc_read_directory(afcClient, normalizedPath, ref directoryEntries),
+        $"Unable to list remote directory '{normalizedPath}'"
     );
 
     try
@@ -1054,9 +1085,19 @@ static IReadOnlyList<string> ReadRemoteDirectoryEntries(IntPtr afcClient, string
     }
 }
 
-static RemoteEntryInfo GetRemoteEntryInfo(IntPtr afcClient, string remotePath)
+static RemoteEntryInfo GetRemoteEntryInfo(IntPtr afcClient, string remotePath, string? udid = null, bool forceRefresh = false)
 {
     string normalizedPath = NormalizeRemotePath(remotePath);
+    return AfcMetadataCache.GetEntryInfo(
+        udid,
+        normalizedPath,
+        () => GetRemoteEntryInfoRaw(afcClient, normalizedPath),
+        forceRefresh
+    );
+}
+
+static RemoteEntryInfo GetRemoteEntryInfoRaw(IntPtr afcClient, string normalizedPath)
+{
     IntPtr fileInfoDictionary = IntPtr.Zero;
     ThrowIfError(
         NativeMethods.afc_get_file_info(afcClient, normalizedPath, ref fileInfoDictionary),
@@ -1178,7 +1219,7 @@ static bool IsRemotePathOrChild(string parentPath, string childPath)
     return normalizedChild.StartsWith($"{normalizedParent}/", StringComparison.Ordinal);
 }
 
-static IReadOnlyList<string> EnumerateRemoteFilesForSelection(IntPtr afcClient, string selectedPath, RemoteEntryInfo info)
+static IReadOnlyList<string> EnumerateRemoteFilesForSelection(IntPtr afcClient, string selectedPath, RemoteEntryInfo info, string? udid = null)
 {
     if (info.IsFile)
     {
@@ -1191,7 +1232,7 @@ static IReadOnlyList<string> EnumerateRemoteFilesForSelection(IntPtr afcClient, 
     }
 
     List<RemoteFileEntry> files = [];
-    EnumerateRemoteFiles(afcClient, NormalizeRemotePath(selectedPath), files);
+    EnumerateRemoteFiles(afcClient, NormalizeRemotePath(selectedPath), files, udid);
     return files.Select(x => x.Path).ToArray();
 }
 
@@ -1253,10 +1294,10 @@ static string? GetParentRemotePath(string remotePath)
     return trimmed[..separatorIndex];
 }
 
-static void DeleteRemotePathRecursive(IntPtr afcClient, string remotePath)
+static void DeleteRemotePathRecursive(IntPtr afcClient, string remotePath, string? udid = null)
 {
     string normalizedPath = NormalizeRemotePath(remotePath);
-    RemoteEntryInfo info = GetRemoteEntryInfo(afcClient, normalizedPath);
+    RemoteEntryInfo info = GetRemoteEntryInfo(afcClient, normalizedPath, udid);
 
     if (info.IsFile)
     {
@@ -1269,10 +1310,10 @@ static void DeleteRemotePathRecursive(IntPtr afcClient, string remotePath)
         throw new InvalidOperationException($"Unable to delete '{normalizedPath}' because it is not a file or directory.");
     }
 
-    foreach (string entry in ReadRemoteDirectoryEntries(afcClient, normalizedPath))
+    foreach (string entry in ReadRemoteDirectoryEntries(afcClient, normalizedPath, udid))
     {
         string childPath = CombineRemotePath(normalizedPath, entry);
-        DeleteRemotePathRecursive(afcClient, childPath);
+        DeleteRemotePathRecursive(afcClient, childPath, udid);
     }
 
     ThrowIfError(NativeMethods.afc_remove_path(afcClient, normalizedPath), $"Unable to delete remote directory '{normalizedPath}'");
@@ -1853,6 +1894,173 @@ internal static class TransferProgressStore
                 Operations.TryRemove(key, out _);
             }
         }
+    }
+}
+
+internal static class AfcMetadataCache
+{
+    private static readonly ConcurrentDictionary<string, CacheEntry<IReadOnlyList<string>>> DirectoryEntries = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, CacheEntry<RemoteEntryInfo>> EntryInfos = new(StringComparer.Ordinal);
+    private static readonly TimeSpan Ttl = TimeSpan.FromSeconds(30);
+
+    public static IReadOnlyList<string> GetDirectoryEntries(string? udid, string normalizedPath, Func<IReadOnlyList<string>> factory, bool forceRefresh = false)
+    {
+        string cacheKey = BuildCacheKey(udid, normalizedPath);
+        if (!forceRefresh && DirectoryEntries.TryGetValue(cacheKey, out CacheEntry<IReadOnlyList<string>>? cached) && !cached.IsExpired(Ttl))
+        {
+            return cached.Value;
+        }
+
+        IReadOnlyList<string> fresh = factory();
+        DirectoryEntries[cacheKey] = new CacheEntry<IReadOnlyList<string>>(fresh);
+        return fresh;
+    }
+
+    public static RemoteEntryInfo GetEntryInfo(string? udid, string normalizedPath, Func<RemoteEntryInfo> factory, bool forceRefresh = false)
+    {
+        string cacheKey = BuildCacheKey(udid, normalizedPath);
+        if (!forceRefresh && EntryInfos.TryGetValue(cacheKey, out CacheEntry<RemoteEntryInfo>? cached) && !cached.IsExpired(Ttl))
+        {
+            return cached.Value;
+        }
+
+        RemoteEntryInfo fresh = factory();
+        EntryInfos[cacheKey] = new CacheEntry<RemoteEntryInfo>(fresh);
+        return fresh;
+    }
+
+    public static void InvalidatePath(string? udid, string remotePath)
+    {
+        string normalizedPath = NormalizeRemotePath(remotePath);
+        string cachePrefix = $"{GetDeviceKey(udid)}|";
+        string pathPrefix = normalizedPath == "/" ? "/" : $"{normalizedPath.TrimEnd('/')}/";
+
+        foreach ((string key, _) in EntryInfos)
+        {
+            if (!key.StartsWith(cachePrefix, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            string keyPath = key[cachePrefix.Length..];
+            if (string.Equals(keyPath, normalizedPath, StringComparison.Ordinal) ||
+                keyPath.StartsWith(pathPrefix, StringComparison.Ordinal))
+            {
+                EntryInfos.TryRemove(key, out _);
+            }
+        }
+
+        foreach ((string key, _) in DirectoryEntries)
+        {
+            if (!key.StartsWith(cachePrefix, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            string keyPath = key[cachePrefix.Length..];
+            if (string.Equals(keyPath, normalizedPath, StringComparison.Ordinal) ||
+                keyPath.StartsWith(pathPrefix, StringComparison.Ordinal) ||
+                string.Equals(GetParentRemotePath(keyPath) ?? "/", normalizedPath, StringComparison.Ordinal))
+            {
+                DirectoryEntries.TryRemove(key, out _);
+            }
+        }
+    }
+
+    private static string BuildCacheKey(string? udid, string normalizedPath) => $"{GetDeviceKey(udid)}|{normalizedPath}";
+
+    private static string GetDeviceKey(string? udid) => string.IsNullOrWhiteSpace(udid) ? "default-device" : udid.Trim();
+
+    private sealed class CacheEntry<T>(T value)
+    {
+        public T Value { get; } = value;
+        public DateTimeOffset CreatedAtUtc { get; } = DateTimeOffset.UtcNow;
+
+        public bool IsExpired(TimeSpan ttl) => DateTimeOffset.UtcNow - CreatedAtUtc > ttl;
+    }
+}
+
+internal static class MediaIndexStore
+{
+    private static readonly ConcurrentDictionary<string, CacheEntry<MediaEnumerationResult>> Snapshots = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> RefreshLocks = new(StringComparer.Ordinal);
+    private static readonly TimeSpan StaleAfter = TimeSpan.FromSeconds(45);
+
+    public static async Task<MediaEnumerationResult> GetOrBuildAsync(string? udid, bool includeAdditionalRoots)
+    {
+        string key = BuildKey(udid, includeAdditionalRoots);
+        if (Snapshots.TryGetValue(key, out CacheEntry<MediaEnumerationResult>? snapshot))
+        {
+            if (snapshot.IsExpired(StaleAfter))
+            {
+                _ = TriggerRefreshAsync(udid, includeAdditionalRoots);
+            }
+
+            return snapshot.Value;
+        }
+
+        return await RefreshAsync(udid, includeAdditionalRoots);
+    }
+
+    public static async Task TriggerRefreshAsync(string? udid, bool includeAdditionalRoots)
+    {
+        try
+        {
+            await RefreshAsync(udid, includeAdditionalRoots);
+        }
+        catch
+        {
+        }
+    }
+
+    public static void MarkDirty(string? udid)
+    {
+        string prefix = $"{GetDeviceKey(udid)}|";
+        foreach ((string key, _) in Snapshots)
+        {
+            if (key.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                Snapshots.TryRemove(key, out _);
+            }
+        }
+    }
+
+    private static async Task<MediaEnumerationResult> RefreshAsync(string? udid, bool includeAdditionalRoots)
+    {
+        string key = BuildKey(udid, includeAdditionalRoots);
+        SemaphoreSlim refreshLock = RefreshLocks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+        await refreshLock.WaitAsync();
+        try
+        {
+            if (Snapshots.TryGetValue(key, out CacheEntry<MediaEnumerationResult>? cached) && !cached.IsExpired(StaleAfter))
+            {
+                return cached.Value;
+            }
+
+            return await Task.Run(() =>
+            {
+                using AfcSession session = AfcSession.Connect(udid);
+                MediaEnumerationResult refreshed = EnumerateMediaAssets(session.AfcClient, includeAdditionalRoots, udid);
+                Snapshots[key] = new CacheEntry<MediaEnumerationResult>(refreshed);
+                return refreshed;
+            });
+        }
+        finally
+        {
+            refreshLock.Release();
+        }
+    }
+
+    private static string BuildKey(string? udid, bool includeAdditionalRoots) => $"{GetDeviceKey(udid)}|{(includeAdditionalRoots ? "all-roots" : "dcim-only")}";
+
+    private static string GetDeviceKey(string? udid) => string.IsNullOrWhiteSpace(udid) ? "default-device" : udid.Trim();
+
+    private sealed class CacheEntry<T>(T value)
+    {
+        public T Value { get; } = value;
+        public DateTimeOffset CreatedAtUtc { get; } = DateTimeOffset.UtcNow;
+
+        public bool IsExpired(TimeSpan ttl) => DateTimeOffset.UtcNow - CreatedAtUtc > ttl;
     }
 }
 
