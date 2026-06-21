@@ -25,11 +25,20 @@ dotnet build /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileCo
 ## Usage
 
 ```bash
-dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- <remoteFilePath> <localOutputPath> [deviceUdid]
+dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [copy|--copy] <remoteFilePath> <localOutputPath> [deviceUdid]
+dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [move|--move] <remoteFilePath> <localOutputPath> [deviceUdid]
 ```
 
-Example:
+### Copy example
 
 ```bash
-dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- "DCIM/100APPLE/IMG_0001.JPG" "/tmp/IMG_0001.JPG"
+dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- copy "DCIM/100APPLE/IMG_0001.JPG" "/tmp/IMG_0001.JPG"
+```
+
+### Move example
+
+`move` copies the remote file, computes SHA-256 for the source data and copied local file, and deletes the remote file only when the hashes match.
+
+```bash
+dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- move "DCIM/100APPLE/IMG_0001.JPG" "/tmp/IMG_0001.JPG"
 ```

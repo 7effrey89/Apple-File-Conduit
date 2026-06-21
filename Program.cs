@@ -1,20 +1,36 @@
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 
-if (args.Length < 2 || args.Length > 3)
+bool deleteSourceAfterCopy = false;
+int firstPathArgumentIndex = 0;
+
+if (args.Length > 0)
 {
-    Console.WriteLine("Usage: AppleFileConduitDemo <remoteFilePath> <localOutputPath> [deviceUdid]");
+    if (args[0] is "--move" or "move")
+    {
+        deleteSourceAfterCopy = true;
+        firstPathArgumentIndex = 1;
+    }
+    else if (args[0] is "--copy" or "copy")
+    {
+        firstPathArgumentIndex = 1;
+    }
+}
+
+if (args.Length - firstPathArgumentIndex < 2 || args.Length - firstPathArgumentIndex > 3)
+{
+    WriteUsage();
     return 1;
 }
 
-string remotePath = args[0];
-string localPath = args[1];
-string? udid = args.Length == 3 ? args[2] : null;
+string remotePath = args[firstPathArgumentIndex];
+string localPath = args[firstPathArgumentIndex + 1];
+string? udid = args.Length - firstPathArgumentIndex == 3 ? args[firstPathArgumentIndex + 2] : null;
 
 IntPtr device = IntPtr.Zero;
 IntPtr lockdowndClient = IntPtr.Zero;
 IntPtr serviceDescriptor = IntPtr.Zero;
 IntPtr afcClient = IntPtr.Zero;
-ulong afcFileHandle = 0;
 
 try
 {
@@ -32,31 +48,22 @@ try
 
     ThrowIfError(NativeMethods.afc_client_new(device, serviceDescriptor, ref afcClient), "Unable to create AFC client");
 
-    ThrowIfError(
-        NativeMethods.afc_file_open(afcClient, remotePath, NativeMethods.AFC_FOPEN_RDONLY, ref afcFileHandle),
-        $"Unable to open remote file '{remotePath}'"
-    );
+    byte[] sourceHash = CopyRemoteFileToLocalAndComputeHash(afcClient, remotePath, localPath);
 
-    string? localDirectory = Path.GetDirectoryName(localPath);
-    if (!string.IsNullOrEmpty(localDirectory))
+    if (deleteSourceAfterCopy)
     {
-        Directory.CreateDirectory(localDirectory);
-    }
+        byte[] localHash = ComputeLocalFileHash(localPath);
 
-    using FileStream output = File.Create(localPath);
-    byte[] buffer = new byte[64 * 1024];
-
-    while (true)
-    {
-        uint bytesRead = 0;
-        ThrowIfError(NativeMethods.afc_file_read(afcClient, afcFileHandle, buffer, (uint)buffer.Length, ref bytesRead), "Failed while reading remote file");
-
-        if (bytesRead == 0)
+        if (!CryptographicOperations.FixedTimeEquals(sourceHash, localHash))
         {
-            break;
+            throw new InvalidOperationException(
+                $"SHA-256 mismatch for '{remotePath}' and '{localPath}'. Remote source file was not deleted."
+            );
         }
 
-        output.Write(buffer, 0, (int)bytesRead);
+        ThrowIfError(NativeMethods.afc_remove_path(afcClient, remotePath), $"Unable to delete remote file '{remotePath}'");
+        Console.WriteLine($"Copied '{remotePath}' to '{localPath}', verified SHA-256, and deleted the remote source file.");
+        return 0;
     }
 
     Console.WriteLine($"Copied '{remotePath}' to '{localPath}'.");
@@ -69,11 +76,6 @@ catch (Exception ex)
 }
 finally
 {
-    if (afcFileHandle != 0 && afcClient != IntPtr.Zero)
-    {
-        NativeMethods.afc_file_close(afcClient, afcFileHandle);
-    }
-
     if (afcClient != IntPtr.Zero)
     {
         NativeMethods.afc_client_free(afcClient);
@@ -93,6 +95,69 @@ finally
     {
         NativeMethods.idevice_free(device);
     }
+}
+
+static void WriteUsage()
+{
+    Console.WriteLine("Usage:");
+    Console.WriteLine("  AppleFileConduitDemo [copy|--copy] <remoteFilePath> <localOutputPath> [deviceUdid]");
+    Console.WriteLine("  AppleFileConduitDemo [move|--move] <remoteFilePath> <localOutputPath> [deviceUdid]");
+}
+
+static byte[] CopyRemoteFileToLocalAndComputeHash(IntPtr afcClient, string remotePath, string localPath)
+{
+    ulong afcFileHandle = 0;
+    ThrowIfError(
+        NativeMethods.afc_file_open(afcClient, remotePath, NativeMethods.AFC_FOPEN_RDONLY, ref afcFileHandle),
+        $"Unable to open remote file '{remotePath}'"
+    );
+
+    try
+    {
+        string? localDirectory = Path.GetDirectoryName(localPath);
+        if (!string.IsNullOrEmpty(localDirectory))
+        {
+            Directory.CreateDirectory(localDirectory);
+        }
+
+        using FileStream output = File.Create(localPath);
+        using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        byte[] buffer = new byte[64 * 1024];
+
+        while (true)
+        {
+            uint bytesRead = 0;
+            ThrowIfError(
+                NativeMethods.afc_file_read(afcClient, afcFileHandle, buffer, (uint)buffer.Length, ref bytesRead),
+                "Failed while reading remote file"
+            );
+
+            if (bytesRead == 0)
+            {
+                break;
+            }
+
+            hash.AppendData(buffer, 0, (int)bytesRead);
+            output.Write(buffer, 0, (int)bytesRead);
+        }
+
+        output.Flush();
+        return hash.GetHashAndReset();
+    }
+    finally
+    {
+        if (afcFileHandle != 0)
+        {
+            NativeMethods.afc_file_close(afcClient, afcFileHandle);
+        }
+    }
+}
+
+static byte[] ComputeLocalFileHash(string localPath)
+{
+    using SHA256 sha256 = SHA256.Create();
+    using FileStream stream = File.OpenRead(localPath);
+    return sha256.ComputeHash(stream);
 }
 
 static void ThrowIfError(int errorCode, string message)
@@ -158,4 +223,7 @@ internal static class NativeMethods
 
     [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
     public static extern int afc_file_close(IntPtr afcClient, ulong handle);
+
+    [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int afc_remove_path(IntPtr afcClient, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
 }
