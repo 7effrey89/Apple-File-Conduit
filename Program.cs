@@ -1089,6 +1089,29 @@ internal static class UiPage
       color: #3152c7;
       font-size: .95rem;
     }
+    .progress-bar {
+      height: 4px;
+      background: color-mix(in srgb, #2867ff 15%, transparent);
+      border-radius: 2px;
+      overflow: hidden;
+      margin-bottom: 12px;
+      display: none;
+      position: relative;
+    }
+    .progress-bar.active { display: block; }
+    .progress-bar::after {
+      content: '';
+      position: absolute;
+      top: 0; bottom: 0; left: 0;
+      width: 40%;
+      background: #2867ff;
+      border-radius: 2px;
+      animation: indeterminate 1.4s ease-in-out infinite;
+    }
+    @keyframes indeterminate {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(250%); }
+    }
     .status {
       min-height: 24px;
       margin-bottom: 16px;
@@ -1235,6 +1258,7 @@ internal static class UiPage
       <button id="refreshButton">Refresh</button>
     </div>
 
+    <div class="progress-bar" id="progressBar"></div>
     <div class="summary" id="summary"></div>
     <div class="status" id="status">Loading media from the device…</div>
     <div class="grid" id="grid"></div>
@@ -1250,6 +1274,7 @@ internal static class UiPage
 
     const summary = document.getElementById('summary');
     const status = document.getElementById('status');
+    const progressBar = document.getElementById('progressBar');
     const grid = document.getElementById('grid');
     const destinationInput = document.getElementById('destination');
     const filterInput = document.getElementById('filter');
@@ -1273,6 +1298,7 @@ internal static class UiPage
       moveButton.disabled = value;
       refreshButton.disabled = value;
       filterInput.disabled = value;
+      progressBar.classList.toggle('active', value);
     }
 
     function setStatus(message, isError = false) {
