@@ -1771,6 +1771,24 @@ static void ThrowIfError(int errorCode, string message)
     NativeError.ThrowIfError(errorCode, message);
 }
 
+static bool TryGetNativeErrorCode(Exception ex, out int errorCode)
+{
+    const string marker = "Native error code:";
+    string message = ex.Message;
+    int markerIndex = message.LastIndexOf(marker, StringComparison.Ordinal);
+    if (markerIndex >= 0)
+    {
+        string codeText = message[(markerIndex + marker.Length)..].Trim();
+        if (int.TryParse(codeText, out errorCode))
+        {
+            return true;
+        }
+    }
+
+    errorCode = 0;
+    return false;
+}
+
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 internal struct LockdownServiceDescriptorRaw
 {
@@ -2763,24 +2781,6 @@ internal static class NativeError
             throw new InvalidOperationException($"{message}. Native error code: {errorCode}");
         }
     }
-}
-
-static bool TryGetNativeErrorCode(Exception ex, out int errorCode)
-{
-    const string marker = "Native error code:";
-    string message = ex.Message;
-    int markerIndex = message.LastIndexOf(marker, StringComparison.Ordinal);
-    if (markerIndex >= 0)
-    {
-        string codeText = message[(markerIndex + marker.Length)..].Trim();
-        if (int.TryParse(codeText, out errorCode))
-        {
-            return true;
-        }
-    }
-
-    errorCode = 0;
-    return false;
 }
 
 internal static class AppJson
