@@ -1,4 +1,6 @@
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
+using System.Reflection;
 using System.Security.Cryptography;
 
 bool deleteSourceAfterCopy = false;
@@ -321,4 +323,26 @@ internal static class NativeMethods
 
     [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
     public static extern void afc_dictionary_free(IntPtr dictionary);
+}
+
+internal static class NativeLibraryBootstrapper
+{
+    [ModuleInitializer]
+    public static void Initialize()
+    {
+        NativeLibrary.SetDllImportResolver(Assembly.GetExecutingAssembly(), Resolve);
+    }
+
+    private static IntPtr Resolve(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
+    {
+        if (libraryName == "imobiledevice-1.0" && OperatingSystem.IsWindows())
+        {
+            if (NativeLibrary.TryLoad("imobiledevice", assembly, searchPath, out IntPtr handle))
+            {
+                return handle;
+            }
+        }
+
+        return IntPtr.Zero;
+    }
 }

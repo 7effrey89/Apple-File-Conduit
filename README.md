@@ -4,11 +4,22 @@ Minimal C# console demo that copies a file from an iPhone using Apple's AFC serv
 
 ## Prerequisites
 
+Install .NET 8 SDK (required for `dotnet run`):
+
+```powershell
+winget install --id Microsoft.DotNet.SDK.8 --exact --accept-package-agreements --accept-source-agreements
+```
+
 Install native dependencies (Linux example):
 
 ```bash
 sudo apt-get install -y libimobiledevice-dev libusbmuxd-dev usbmuxd
 ```
+
+Windows note:
+
+- This project references `imobiledevice-net`, which provides the native `libimobiledevice` binaries for Windows in the build output.
+- The P/Invoke resolver maps `imobiledevice-1.0` to `imobiledevice` on Windows.
 
 Trust/unlock your iPhone and verify it is visible:
 
