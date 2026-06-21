@@ -744,6 +744,14 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             return;
         }
 
+        if (path == "/api/ptp-retry" && context.Request.HttpMethod == "POST")
+        {
+            MediaIndexStore.PtpFallbackState.Clear(udid);
+            MediaIndexStore.MarkDirty(udid);
+            await WriteJsonResponseAsync(context.Response, new { message = "PTP retry state cleared. The next scan will attempt PTP." });
+            return;
+        }
+
         context.Response.StatusCode = (int)HttpStatusCode.NotFound;
         await WriteJsonResponseAsync(context.Response, new ErrorResponse("The requested resource was not found."));
     }
@@ -3530,6 +3538,7 @@ internal static class UiPage
         <span>Include PhotoData</span>
       </label>
       <button id="scanButton">Scan Media</button>
+      <button class="hidden" id="retryPtpButton" title="Clear the PTP retry cooldown and scan again using PTP">Retry PTP</button>
       <button class="primary" id="copyButton">Copy Selected</button>
       <button class="danger" id="moveButton">Move Selected</button>
       <button class="primary hidden" id="fsCopyButton">Copy Selected Paths</button>
@@ -3702,7 +3711,8 @@ internal static class UiPage
       fsSelected: new Set(),
       transferProgressSnapshot: null,
       transferProgressOperationId: null,
-      transferProgressTimer: null
+      transferProgressTimer: null,
+      ptpFallbackActive: false
     };
 
     const summary = document.getElementById('summary');
@@ -3718,6 +3728,7 @@ internal static class UiPage
     const filterInput = document.getElementById('filter');
     const includeAdditionalRootsInput = document.getElementById('includeAdditionalRoots');
     const scanButton = document.getElementById('scanButton');
+    const retryPtpButton = document.getElementById('retryPtpButton');
     const copyButton = document.getElementById('copyButton');
     const moveButton = document.getElementById('moveButton');
     const fsCopyButton = document.getElementById('fsCopyButton');
@@ -3759,6 +3770,7 @@ internal static class UiPage
 
     viewModeInput.addEventListener('change', () => setViewMode(viewModeInput.value));
     scanButton.addEventListener('click', () => loadMedia());
+    retryPtpButton.addEventListener('click', () => retryPtp());
     copyButton.addEventListener('click', () => transfer('copy'));
     moveButton.addEventListener('click', () => transfer('move'));
     fsCopyButton.addEventListener('click', () => transferFs('copy'));
@@ -3807,6 +3819,7 @@ internal static class UiPage
       copyButton.disabled = value;
       moveButton.disabled = value;
       scanButton.disabled = value;
+      retryPtpButton.disabled = value;
       fsCopyButton.disabled = value;
       fsMoveButton.disabled = value;
       fsDeleteButton.disabled = value;
@@ -4079,6 +4092,7 @@ internal static class UiPage
       fsView.classList.toggle('hidden', !fsMode);
       filterInput.classList.toggle('hidden', fsMode);
       scanButton.classList.toggle('hidden', fsMode);
+      retryPtpButton.classList.toggle('hidden', fsMode || !state.ptpFallbackActive);
       copyButton.classList.toggle('hidden', fsMode);
       moveButton.classList.toggle('hidden', fsMode);
       fsCopyButton.classList.toggle('hidden', !fsMode);
@@ -4335,6 +4349,8 @@ internal static class UiPage
         state.selected.clear();
         renderSummary();
         renderGrid();
+        state.ptpFallbackActive = Boolean(data.backendNote);
+        retryPtpButton.classList.toggle('hidden', !state.ptpFallbackActive);
         setStatus(buildMediaLoadStatus(data));
       } catch (error) {
         state.items = [];
@@ -4345,6 +4361,13 @@ internal static class UiPage
       } finally {
         setBusy(false);
       }
+    }
+
+    async function retryPtp() {
+      try {
+        await fetch('/api/ptp-retry', { method: 'POST' });
+      } catch { }
+      await loadMedia();
     }
 
     async function loadFs(path) {
