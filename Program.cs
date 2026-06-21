@@ -199,14 +199,17 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
 
         if (path == "/api/media" && context.Request.HttpMethod == "GET")
         {
+            bool includeAdditionalRoots = IsTruthy(context.Request.QueryString["includeAdditionalRoots"]);
             using AfcSession session = AfcSession.Connect(udid);
-            IReadOnlyList<MediaAsset> assets = EnumerateMediaAssets(session.AfcClient);
+            MediaEnumerationResult media = EnumerateMediaAssets(session.AfcClient, includeAdditionalRoots);
+            IReadOnlyList<MediaAsset> assets = media.Assets;
 
             MediaLibraryResponse payload = new(
                 assets.Select(MediaAssetView.FromAsset).ToArray(),
                 assets.Count(x => x.Kind == MediaKind.Photo),
                 assets.Count(x => x.Kind == MediaKind.LivePhoto),
-                assets.Count(x => x.Kind == MediaKind.Video)
+                assets.Count(x => x.Kind == MediaKind.Video),
+                media.ScannedRoots
             );
 
             await WriteJsonResponseAsync(context.Response, payload);
@@ -252,7 +255,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             bool deleteAfterCopy = string.Equals(request.Operation, "move", StringComparison.OrdinalIgnoreCase);
 
             using AfcSession session = AfcSession.Connect(udid);
-            IReadOnlyList<MediaAsset> assets = EnumerateMediaAssets(session.AfcClient);
+            IReadOnlyList<MediaAsset> assets = EnumerateMediaAssets(session.AfcClient, request.IncludeAdditionalRoots).Assets;
             Dictionary<string, MediaAsset> assetsById = assets.ToDictionary(x => x.Id, StringComparer.Ordinal);
             List<string> copiedPaths = [];
 
@@ -435,10 +438,39 @@ static void ListRemoteDirectory(IntPtr afcClient, string remotePath)
     }
 }
 
-static IReadOnlyList<MediaAsset> EnumerateMediaAssets(IntPtr afcClient)
+static MediaEnumerationResult EnumerateMediaAssets(IntPtr afcClient, bool includeAdditionalRoots)
 {
     List<RemoteFileEntry> files = [];
-    EnumerateRemoteFiles(afcClient, "DCIM", files);
+    List<string> scannedRoots = [];
+    List<string> rootsToScan = ["DCIM"];
+
+    if (includeAdditionalRoots)
+    {
+        rootsToScan.Add("PhotoData");
+    }
+
+    foreach (string root in rootsToScan)
+    {
+        if (string.Equals(root, "DCIM", StringComparison.OrdinalIgnoreCase))
+        {
+            EnumerateRemoteFiles(afcClient, root, files);
+            scannedRoots.Add(root);
+            continue;
+        }
+
+        try
+        {
+            EnumerateRemoteFiles(afcClient, root, files);
+            scannedRoots.Add(root);
+        }
+        catch (InvalidOperationException)
+        {
+        }
+    }
+
+    files = files
+        .DistinctBy(x => x.Path, StringComparer.OrdinalIgnoreCase)
+        .ToList();
 
     List<RemoteFileEntry> images = files.Where(x => IsImageFile(x.Path)).OrderByDescending(x => x.Path, StringComparer.OrdinalIgnoreCase).ToList();
     List<RemoteFileEntry> videos = files.Where(x => IsVideoFile(x.Path)).OrderByDescending(x => x.Path, StringComparer.OrdinalIgnoreCase).ToList();
@@ -497,7 +529,10 @@ static IReadOnlyList<MediaAsset> EnumerateMediaAssets(IntPtr afcClient)
         );
     }
 
-    return assets.OrderByDescending(x => x.PrimaryRemotePath, StringComparer.OrdinalIgnoreCase).ToArray();
+    return new MediaEnumerationResult(
+        assets.OrderByDescending(x => x.PrimaryRemotePath, StringComparer.OrdinalIgnoreCase).ToArray(),
+        scannedRoots.ToArray()
+    );
 }
 
 static void EnumerateRemoteFiles(IntPtr afcClient, string remoteDirectoryPath, List<RemoteFileEntry> files)
@@ -627,7 +662,7 @@ static string BuildLocalOutputPath(string destinationDirectory, string remotePat
 {
     string relativePath = remotePath.StartsWith("DCIM/", StringComparison.OrdinalIgnoreCase)
         ? remotePath["DCIM/".Length..]
-        : Path.GetFileName(remotePath);
+        : remotePath.TrimStart('/');
 
     string[] segments = relativePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
     return Path.Combine(destinationDirectory, Path.Combine(segments));
@@ -749,6 +784,8 @@ static string GetContentType(string remotePath)
         ".webp" => "image/webp",
         ".heic" => "image/heic",
         ".heif" => "image/heif",
+        ".dng" => "image/x-adobe-dng",
+        ".tif" or ".tiff" => "image/tiff",
         ".mov" => "video/quicktime",
         ".mp4" => "video/mp4",
         ".m4v" => "video/x-m4v",
@@ -772,9 +809,19 @@ static bool IsImageFile(string remotePath)
 {
     return Path.GetExtension(remotePath).ToLowerInvariant() switch
     {
-        ".jpg" or ".jpeg" or ".png" or ".gif" or ".bmp" or ".webp" or ".heic" or ".heif" => true,
+        ".jpg" or ".jpeg" or ".png" or ".gif" or ".bmp" or ".webp" or ".heic" or ".heif" or ".dng" or ".tif" or ".tiff" => true,
         _ => false
     };
+}
+
+static bool IsTruthy(string? value)
+{
+    return value is not null && (
+        string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(value, "on", StringComparison.OrdinalIgnoreCase)
+    );
 }
 
 static bool IsVideoFile(string remotePath)
@@ -918,6 +965,8 @@ internal enum MediaKind
     Video
 }
 
+internal sealed record MediaEnumerationResult(IReadOnlyList<MediaAsset> Assets, string[] ScannedRoots);
+
 internal sealed record MediaAssetView(
     string Id,
     string Name,
@@ -930,7 +979,10 @@ internal sealed record MediaAssetView(
 {
     public static MediaAssetView FromAsset(MediaAsset asset)
     {
-        string previewMode = asset.Kind == MediaKind.Video ? "video" : "image";
+        string extension = Path.GetExtension(asset.PrimaryRemotePath).ToLowerInvariant();
+        string previewMode = asset.Kind == MediaKind.Video
+            ? "video"
+            : extension is ".jpg" or ".jpeg" or ".png" or ".gif" or ".bmp" or ".webp" ? "image" : "placeholder";
         return new MediaAssetView(
             asset.Id,
             asset.Name,
@@ -950,9 +1002,9 @@ internal sealed record MediaAssetView(
     }
 }
 
-internal sealed record MediaLibraryResponse(MediaAssetView[] Items, int PhotoCount, int LivePhotoCount, int VideoCount);
+internal sealed record MediaLibraryResponse(MediaAssetView[] Items, int PhotoCount, int LivePhotoCount, int VideoCount, string[] ScannedRoots);
 
-internal sealed record TransferRequest(string[] AssetIds, string DestinationDirectory, string Operation);
+internal sealed record TransferRequest(string[] AssetIds, string DestinationDirectory, string Operation, bool IncludeAdditionalRoots);
 
 internal sealed record TransferResponse(string Message, string[] LocalPaths);
 
@@ -1034,7 +1086,7 @@ internal static class UiPage
       padding: 16px;
       display: grid;
       gap: 12px;
-      grid-template-columns: minmax(280px, 1fr) repeat(4, auto);
+      grid-template-columns: minmax(280px, 1fr) repeat(5, auto);
       align-items: center;
       margin-bottom: 16px;
     }
@@ -1048,13 +1100,27 @@ internal static class UiPage
     input, select, button {
       font: inherit;
     }
-    input, select {
+    input:not([type="checkbox"]), select {
       width: 100%;
       padding: 12px 14px;
       border-radius: 12px;
       border: 1px solid var(--border);
       background: rgba(255,255,255,0.9);
       color: inherit;
+    }
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 6px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .toggle input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      margin: 0;
+      accent-color: var(--accent);
     }
     button {
       border: 0;
@@ -1253,6 +1319,10 @@ internal static class UiPage
         <option value="live-photo">Live Photos</option>
         <option value="video">Videos</option>
       </select>
+      <label class="toggle">
+        <input type="checkbox" id="includeAdditionalRoots">
+        <span>Include PhotoData</span>
+      </label>
       <button class="primary" id="copyButton">Copy Selected</button>
       <button class="danger" id="moveButton">Move Selected</button>
       <button id="refreshButton">Refresh</button>
@@ -1278,6 +1348,7 @@ internal static class UiPage
     const grid = document.getElementById('grid');
     const destinationInput = document.getElementById('destination');
     const filterInput = document.getElementById('filter');
+    const includeAdditionalRootsInput = document.getElementById('includeAdditionalRoots');
     const copyButton = document.getElementById('copyButton');
     const moveButton = document.getElementById('moveButton');
     const refreshButton = document.getElementById('refreshButton');
@@ -1288,6 +1359,7 @@ internal static class UiPage
       renderSummary();
     });
 
+    includeAdditionalRootsInput.addEventListener('change', () => loadMedia());
     refreshButton.addEventListener('click', () => loadMedia());
     copyButton.addEventListener('click', () => transfer('copy'));
     moveButton.addEventListener('click', () => transfer('move'));
@@ -1298,6 +1370,7 @@ internal static class UiPage
       moveButton.disabled = value;
       refreshButton.disabled = value;
       filterInput.disabled = value;
+      includeAdditionalRootsInput.disabled = value;
       progressBar.classList.toggle('active', value);
     }
 
@@ -1363,8 +1436,10 @@ internal static class UiPage
         const durationMarkup = item.kind === 'video' ? '<div class="duration">Video</div>' : '';
         const selectorText = selected ? '&#10003;' : '';
         const preview = item.previewMode === 'video'
-          ? `<div class="video-preview"><video preload="metadata" muted playsinline src="${item.previewUrl}"></video><div class="fallback-icon">▶</div></div>`
-          : `<img class="preview" loading="lazy" src="${item.previewUrl}" alt="${escapeHtml(item.name)}">`;
+          ? `<div class="video-preview"><video preload="auto" muted playsinline src="${item.previewUrl}"></video><div class="fallback-icon">▶</div></div>`
+          : item.previewMode === 'image'
+            ? `<img class="preview" loading="lazy" src="${item.previewUrl}" alt="${escapeHtml(item.name)}">`
+            : buildImageFallbackMarkup(item);
 
         card.innerHTML = `
           ${preview}
@@ -1383,10 +1458,13 @@ internal static class UiPage
           const duration = card.querySelector('.duration');
 
           video.addEventListener('loadedmetadata', () => {
-            fallback.style.display = 'none';
             if (Number.isFinite(video.duration)) {
               duration.textContent = formatDuration(video.duration);
             }
+          });
+
+          video.addEventListener('loadeddata', () => {
+            fallback.style.display = 'none';
           });
 
           video.addEventListener('error', () => {
@@ -1398,7 +1476,7 @@ internal static class UiPage
         const image = card.querySelector('img');
         if (image) {
           image.addEventListener('error', () => {
-            image.replaceWith(buildImageFallback());
+            image.replaceWith(buildImageFallback(item));
           });
         }
 
@@ -1406,11 +1484,31 @@ internal static class UiPage
       }
     }
 
-    function buildImageFallback() {
+    function buildImageFallbackMarkup(item) {
+      return `<div class="video-preview"><div class="fallback-icon">${escapeHtml(getFileExtension(item))}</div></div>`;
+    }
+
+    function buildImageFallback(item) {
       const fallback = document.createElement('div');
-      fallback.className = 'video-preview';
-      fallback.innerHTML = '<div class="fallback-icon">🖼</div>';
-      return fallback;
+      fallback.innerHTML = buildImageFallbackMarkup(item);
+      return fallback.firstElementChild;
+    }
+
+    function getFileExtension(item) {
+      const match = item.relativePath.match(/\.([^.\/]+)$/);
+      return match ? match[1].toUpperCase() : 'FILE';
+    }
+
+    function formatRootList(roots) {
+      if (!roots || roots.length === 0) {
+        return 'the device';
+      }
+
+      if (roots.length === 1) {
+        return roots[0];
+      }
+
+      return `${roots.slice(0, -1).join(', ')} and ${roots[roots.length - 1]}`;
     }
 
     function toggleSelection(id) {
@@ -1429,7 +1527,7 @@ internal static class UiPage
       setStatus('Loading media from the device…');
 
       try {
-        const response = await fetch('/api/media');
+        const response = await fetch(`/api/media?includeAdditionalRoots=${includeAdditionalRootsInput.checked}`);
         const data = await response.json();
 
         if (!response.ok) {
@@ -1440,7 +1538,7 @@ internal static class UiPage
         state.selected.clear();
         renderSummary();
         renderGrid();
-        setStatus(`Loaded ${state.items.length} items from DCIM.`);
+        setStatus(`Loaded ${state.items.length} items from ${formatRootList(data.scannedRoots)}.`);
       } catch (error) {
         state.items = [];
         state.selected.clear();
@@ -1479,7 +1577,8 @@ internal static class UiPage
           body: JSON.stringify({
             assetIds: Array.from(state.selected),
             destinationDirectory,
-            operation
+            operation,
+            includeAdditionalRoots: includeAdditionalRootsInput.checked
           })
         });
 
