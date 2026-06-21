@@ -615,9 +615,9 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                             failures.Add(new FailedTransferItem(remotePath, null, $"Delete after copy failed: {ex.Message}"));
                         }
 
-                        foreach (string path in asset.RemotePaths)
+                        foreach (string failedPath in asset.RemotePaths)
                         {
-                            failedRemotePaths.Add(path);
+                            failedRemotePaths.Add(failedPath);
                         }
                     }
                 }
