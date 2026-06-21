@@ -48,7 +48,10 @@ dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/App
 dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- ui
 ```
 
-The UI starts a local web server, opens a browser, loads media from the iPhone `DCIM` folders, labels photo/live photo/video items, and lets you copy or move the selected items to an absolute destination folder on the computer.
+The UI starts a local web server, opens a browser, and provides two views:
+
+- **Media view**: choose options (including **Include PhotoData**) and click **Scan Media** to load photo/live photo/video items, then copy or move selected media to an absolute local destination.
+- **File system view**: browse remote folders, select folders/files, and copy, move, or delete selected paths.
 
 - Enable **Include PhotoData** in the toolbar to also scan the optional `PhotoData` media tree when it is available through AFC.
 - The browser UI recognizes additional image formats including `.dng`, `.tif`, and `.tiff`. Formats that the browser cannot preview directly are still listed and can be copied or moved.

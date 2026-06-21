@@ -216,6 +216,43 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             return;
         }
 
+        if (path == "/api/fs" && context.Request.HttpMethod == "GET")
+        {
+            string requestedPath = context.Request.QueryString["path"] ?? "DCIM";
+            string normalizedPath = NormalizeRemotePath(requestedPath);
+
+            using AfcSession session = AfcSession.Connect(udid);
+            RemoteEntryInfo targetInfo = GetRemoteEntryInfo(session.AfcClient, normalizedPath);
+            if (!targetInfo.IsDirectory)
+            {
+                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                await WriteJsonResponseAsync(context.Response, new ErrorResponse("The selected remote path is not a folder."));
+                return;
+            }
+
+            RemoteFsEntry[] entries = ReadRemoteDirectoryEntries(session.AfcClient, normalizedPath)
+                .Select(entry =>
+                {
+                    string childPath = CombineRemotePath(normalizedPath, entry);
+                    RemoteEntryInfo info = GetRemoteEntryInfo(session.AfcClient, childPath);
+                    return new RemoteFsEntry(entry, childPath, info.IsDirectory, info.IsFile, info.SizeBytes);
+                })
+                .OrderByDescending(x => x.IsDirectory)
+                .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            await WriteJsonResponseAsync(
+                context.Response,
+                new RemoteFsListingResponse(
+                    normalizedPath,
+                    GetParentRemotePath(normalizedPath),
+                    entries
+                )
+            );
+
+            return;
+        }
+
         if (path == "/api/file" && context.Request.HttpMethod == "GET")
         {
             string? id = context.Request.QueryString["id"];
@@ -231,6 +268,104 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
 
             using AfcSession session = AfcSession.Connect(udid);
             await StreamRemoteFileToHttpResponseAsync(session.AfcClient, remotePath, context.Response);
+            return;
+        }
+
+        if (path == "/api/fs/transfer" && context.Request.HttpMethod == "POST")
+        {
+            FsTransferRequest? request = await JsonSerializer.DeserializeAsync<FsTransferRequest>(context.Request.InputStream, AppJson.Options);
+            if (request is null || request.SelectedPaths is null || request.SelectedPaths.Length == 0)
+            {
+                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                await WriteJsonResponseAsync(context.Response, new ErrorResponse("Select at least one file or folder first."));
+                return;
+            }
+
+            string operation = request.Operation?.Trim().ToLowerInvariant() ?? string.Empty;
+            bool deleteOnly = operation == "delete";
+            bool move = operation == "move";
+            bool copy = operation == "copy";
+
+            if (!deleteOnly && !move && !copy)
+            {
+                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                await WriteJsonResponseAsync(context.Response, new ErrorResponse("Operation must be copy, move, or delete."));
+                return;
+            }
+
+            if (!deleteOnly && (string.IsNullOrWhiteSpace(request.DestinationDirectory) || !Path.IsPathRooted(request.DestinationDirectory)))
+            {
+                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                await WriteJsonResponseAsync(context.Response, new ErrorResponse("Enter an absolute destination directory path."));
+                return;
+            }
+
+            string[] selectedPaths = NormalizeAndPruneSelectedPaths(request.SelectedPaths);
+            if (selectedPaths.Any(x => x == "/"))
+            {
+                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                await WriteJsonResponseAsync(context.Response, new ErrorResponse("Selecting the remote root folder is not supported."));
+                return;
+            }
+
+            using AfcSession session = AfcSession.Connect(udid);
+
+            if (deleteOnly)
+            {
+                foreach (string selectedPath in selectedPaths)
+                {
+                    DeleteRemotePathRecursive(session.AfcClient, selectedPath);
+                }
+
+                await WriteJsonResponseAsync(
+                    context.Response,
+                    new TransferResponse("Deleted the selected items.", Array.Empty<string>())
+                );
+                return;
+            }
+
+            List<(string SelectedPath, string RemoteFilePath, string LocalPath, byte[] SourceHash)> transferredFiles = [];
+            foreach (string selectedPath in selectedPaths)
+            {
+                string selectionPath = NormalizeRemotePath(selectedPath);
+                RemoteEntryInfo info = GetRemoteEntryInfo(session.AfcClient, selectionPath);
+                IReadOnlyList<string> filesToCopy = EnumerateRemoteFilesForSelection(session.AfcClient, selectionPath, info);
+
+                foreach (string remoteFilePath in filesToCopy)
+                {
+                    string localPath = BuildLocalOutputPathForSelection(request.DestinationDirectory!, selectionPath, remoteFilePath);
+                    byte[] sourceHash = CopyRemoteFileToLocalAndComputeHash(session.AfcClient, remoteFilePath, localPath);
+                    transferredFiles.Add((selectionPath, remoteFilePath, localPath, sourceHash));
+                }
+            }
+
+            if (move)
+            {
+                foreach ((_, string remoteFilePath, string localPath, byte[] sourceHash) in transferredFiles)
+                {
+                    byte[] localHash = ComputeLocalFileHash(localPath);
+                    if (!CryptographicOperations.FixedTimeEquals(sourceHash, localHash))
+                    {
+                        throw new InvalidOperationException(
+                            $"SHA-256 mismatch for '{remoteFilePath}' and '{localPath}'. Remote source files were not deleted."
+                        );
+                    }
+                }
+
+                foreach (string selectedPath in selectedPaths)
+                {
+                    DeleteRemotePathRecursive(session.AfcClient, selectedPath);
+                }
+            }
+
+            await WriteJsonResponseAsync(
+                context.Response,
+                new TransferResponse(
+                    move ? "Moved the selected items." : "Copied the selected items.",
+                    transferredFiles.Select(x => x.LocalPath).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
+                )
+            );
+
             return;
         }
 
@@ -600,19 +735,27 @@ static IReadOnlyList<string> ReadRemoteDirectoryEntries(IntPtr afcClient, string
 
 static RemoteEntryInfo GetRemoteEntryInfo(IntPtr afcClient, string remotePath)
 {
+    string normalizedPath = NormalizeRemotePath(remotePath);
     IntPtr fileInfoDictionary = IntPtr.Zero;
     ThrowIfError(
-        NativeMethods.afc_get_file_info(afcClient, remotePath, ref fileInfoDictionary),
-        $"Unable to inspect remote path '{remotePath}'"
+        NativeMethods.afc_get_file_info(afcClient, normalizedPath, ref fileInfoDictionary),
+        $"Unable to inspect remote path '{normalizedPath}'"
     );
 
     try
     {
         Dictionary<string, string> values = ReadDictionary(fileInfoDictionary);
         values.TryGetValue("st_ifmt", out string? fileType);
+        long? size = null;
+        if (values.TryGetValue("st_size", out string? sizeValue) && long.TryParse(sizeValue, out long parsedSize))
+        {
+            size = parsedSize;
+        }
+
         return new RemoteEntryInfo(
             string.Equals(fileType, "S_IFDIR", StringComparison.Ordinal),
-            string.Equals(fileType, "S_IFREG", StringComparison.Ordinal)
+            string.Equals(fileType, "S_IFREG", StringComparison.Ordinal),
+            size
         );
     }
     finally
@@ -656,6 +799,162 @@ static Dictionary<string, string> ReadDictionary(IntPtr dictionary)
     }
 
     return values;
+}
+
+static string NormalizeRemotePath(string remotePath)
+{
+    if (string.IsNullOrWhiteSpace(remotePath))
+    {
+        return "/";
+    }
+
+    string normalized = remotePath.Replace('\\', '/').Trim();
+    if (normalized == "/")
+    {
+        return "/";
+    }
+
+    return normalized.Trim('/');
+}
+
+static string[] NormalizeAndPruneSelectedPaths(IEnumerable<string> selectedPaths)
+{
+    List<string> normalized = selectedPaths
+        .Where(x => !string.IsNullOrWhiteSpace(x))
+        .Select(NormalizeRemotePath)
+        .Distinct(StringComparer.Ordinal)
+        .OrderBy(x => x.Length)
+        .ToList();
+
+    List<string> pruned = [];
+    foreach (string candidate in normalized)
+    {
+        if (pruned.Any(existing => IsRemotePathOrChild(existing, candidate)))
+        {
+            continue;
+        }
+
+        pruned.Add(candidate);
+    }
+
+    return pruned.ToArray();
+}
+
+static bool IsRemotePathOrChild(string parentPath, string childPath)
+{
+    string normalizedParent = NormalizeRemotePath(parentPath);
+    string normalizedChild = NormalizeRemotePath(childPath);
+    if (string.Equals(normalizedParent, normalizedChild, StringComparison.Ordinal))
+    {
+        return true;
+    }
+
+    if (normalizedParent == "/")
+    {
+        return true;
+    }
+
+    return normalizedChild.StartsWith($"{normalizedParent}/", StringComparison.Ordinal);
+}
+
+static IReadOnlyList<string> EnumerateRemoteFilesForSelection(IntPtr afcClient, string selectedPath, RemoteEntryInfo info)
+{
+    if (info.IsFile)
+    {
+        return new[] { NormalizeRemotePath(selectedPath) };
+    }
+
+    if (!info.IsDirectory)
+    {
+        throw new InvalidOperationException($"The selected path '{selectedPath}' is no longer available.");
+    }
+
+    List<RemoteFileEntry> files = [];
+    EnumerateRemoteFiles(afcClient, NormalizeRemotePath(selectedPath), files);
+    return files.Select(x => x.Path).ToArray();
+}
+
+static string BuildLocalOutputPathForSelection(string destinationDirectory, string selectedPath, string remoteFilePath)
+{
+    string normalizedSelectedPath = NormalizeRemotePath(selectedPath);
+    string normalizedRemoteFilePath = NormalizeRemotePath(remoteFilePath);
+    string selectedName = GetRemotePathName(normalizedSelectedPath);
+
+    if (string.IsNullOrEmpty(selectedName))
+    {
+        selectedName = "root";
+    }
+
+    string relativeFilePath;
+    if (string.Equals(normalizedSelectedPath, normalizedRemoteFilePath, StringComparison.Ordinal))
+    {
+        relativeFilePath = selectedName;
+    }
+    else
+    {
+        string prefix = $"{normalizedSelectedPath.TrimEnd('/')}/";
+        relativeFilePath = normalizedRemoteFilePath.StartsWith(prefix, StringComparison.Ordinal)
+            ? $"{selectedName}/{normalizedRemoteFilePath[prefix.Length..]}"
+            : $"{selectedName}/{Path.GetFileName(normalizedRemoteFilePath)}";
+    }
+
+    string[] segments = relativeFilePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+    return Path.Combine(destinationDirectory, Path.Combine(segments));
+}
+
+static string GetRemotePathName(string remotePath)
+{
+    string normalized = NormalizeRemotePath(remotePath).Trim('/');
+    if (string.IsNullOrEmpty(normalized))
+    {
+        return string.Empty;
+    }
+
+    int separatorIndex = normalized.LastIndexOf('/');
+    return separatorIndex >= 0 ? normalized[(separatorIndex + 1)..] : normalized;
+}
+
+static string? GetParentRemotePath(string remotePath)
+{
+    string normalized = NormalizeRemotePath(remotePath);
+    if (normalized == "/")
+    {
+        return null;
+    }
+
+    string trimmed = normalized.Trim('/');
+    int separatorIndex = trimmed.LastIndexOf('/');
+    if (separatorIndex < 0)
+    {
+        return "/";
+    }
+
+    return trimmed[..separatorIndex];
+}
+
+static void DeleteRemotePathRecursive(IntPtr afcClient, string remotePath)
+{
+    string normalizedPath = NormalizeRemotePath(remotePath);
+    RemoteEntryInfo info = GetRemoteEntryInfo(afcClient, normalizedPath);
+
+    if (info.IsFile)
+    {
+        ThrowIfError(NativeMethods.afc_remove_path(afcClient, normalizedPath), $"Unable to delete remote file '{normalizedPath}'");
+        return;
+    }
+
+    if (!info.IsDirectory)
+    {
+        throw new InvalidOperationException($"Unable to delete '{normalizedPath}' because it is not a file or directory.");
+    }
+
+    foreach (string entry in ReadRemoteDirectoryEntries(afcClient, normalizedPath))
+    {
+        string childPath = CombineRemotePath(normalizedPath, entry);
+        DeleteRemotePathRecursive(afcClient, childPath);
+    }
+
+    ThrowIfError(NativeMethods.afc_remove_path(afcClient, normalizedPath), $"Unable to delete remote directory '{normalizedPath}'");
 }
 
 static string BuildLocalOutputPath(string destinationDirectory, string remotePath)
@@ -948,7 +1247,7 @@ internal sealed class AfcSession : IDisposable
 
 internal sealed record RemoteFileEntry(string Path);
 
-internal sealed record RemoteEntryInfo(bool IsDirectory, bool IsFile);
+internal sealed record RemoteEntryInfo(bool IsDirectory, bool IsFile, long? SizeBytes);
 
 internal sealed record MediaAsset(
     string Id,
@@ -1007,6 +1306,12 @@ internal sealed record MediaLibraryResponse(MediaAssetView[] Items, int PhotoCou
 internal sealed record TransferRequest(string[] AssetIds, string DestinationDirectory, string Operation, bool IncludeAdditionalRoots);
 
 internal sealed record TransferResponse(string Message, string[] LocalPaths);
+
+internal sealed record FsTransferRequest(string[] SelectedPaths, string? DestinationDirectory, string Operation);
+
+internal sealed record RemoteFsEntry(string Name, string Path, bool IsDirectory, bool IsFile, long? SizeBytes);
+
+internal sealed record RemoteFsListingResponse(string CurrentPath, string? ParentPath, RemoteFsEntry[] Entries);
 
 internal sealed record ErrorResponse(string Message);
 
@@ -1296,12 +1601,59 @@ internal static class UiPage
       border: 1px solid var(--border);
       box-shadow: var(--shadow);
     }
+    .hidden { display: none !important; }
+    .fs-view {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      box-shadow: var(--shadow);
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+    .fs-toolbar {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: minmax(200px, 1fr) auto auto;
+      align-items: center;
+    }
+    .fs-list {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      background: rgba(255,255,255,0.85);
+    }
+    .fs-row {
+      display: grid;
+      grid-template-columns: auto minmax(180px, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .fs-row:last-child { border-bottom: 0; }
+    .fs-row button {
+      padding: 8px 10px;
+      border-radius: 8px;
+    }
+    .fs-row .path {
+      color: var(--muted);
+      font-size: .88rem;
+      word-break: break-all;
+    }
+    .fs-row .meta {
+      color: var(--muted);
+      font-size: .85rem;
+      white-space: nowrap;
+    }
     @media (max-width: 900px) {
       .toolbar { grid-template-columns: 1fr 1fr; }
+      .fs-toolbar { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
       .page { padding: 16px; }
       .toolbar { grid-template-columns: 1fr; }
+      .fs-row { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -1310,12 +1662,16 @@ internal static class UiPage
     <div class="header">
       <div>
         <h1>Apple File Conduit</h1>
-        <div class="subtitle">Browse photos, live photos, and videos from the connected iPhone and copy or move the selected items.</div>
+        <div class="subtitle">Browse media or the remote file system from the connected iPhone and copy, move, or delete selected items.</div>
       </div>
     </div>
 
     <div class="toolbar">
       <input id="destination" placeholder="Enter an absolute destination folder, for example C:\Users\you\Pictures\Imports or /home/you/Pictures/Imports">
+      <select id="viewMode">
+        <option value="media">Media view</option>
+        <option value="filesystem">File system view</option>
+      </select>
       <select id="filter">
         <option value="all">All media</option>
         <option value="photo">Photos</option>
@@ -1326,15 +1682,32 @@ internal static class UiPage
         <input type="checkbox" id="includeAdditionalRoots" title="Any iCloud-downloaded originals that live in /var/mobile/Media/PhotoData/">
         <span>Include PhotoData</span>
       </label>
+      <button id="scanButton">Scan Media</button>
       <button class="primary" id="copyButton">Copy Selected</button>
       <button class="danger" id="moveButton">Move Selected</button>
-      <button id="refreshButton">Refresh</button>
+      <button class="primary hidden" id="fsCopyButton">Copy Selected Paths</button>
+      <button class="danger hidden" id="fsMoveButton">Move Selected Paths</button>
+      <button class="danger hidden" id="fsDeleteButton">Delete Selected Paths</button>
+      <button class="hidden" id="fsRefreshButton">Refresh Folder</button>
     </div>
 
     <div class="progress-bar" id="progressBar"></div>
-    <div class="summary" id="summary"></div>
-    <div class="status" id="status">Loading media from the device…</div>
-    <div class="grid" id="grid"></div>
+    <div class="status" id="status">Choose options and click Scan Media to start.</div>
+
+    <div id="mediaView">
+      <div class="summary" id="summary"></div>
+      <div class="grid" id="grid"></div>
+    </div>
+
+    <div class="fs-view hidden" id="fsView">
+      <div class="fs-toolbar">
+        <input id="fsPath" value="DCIM" placeholder="Remote folder path, for example DCIM or PhotoData">
+        <button id="fsOpenButton">Open Folder</button>
+        <button id="fsUpButton">Up</button>
+      </div>
+      <div class="summary" id="fsSummary"></div>
+      <div class="fs-list" id="fsList"></div>
+    </div>
   </div>
 
   <script>
@@ -1342,19 +1715,36 @@ internal static class UiPage
       items: [],
       selected: new Set(),
       filter: 'all',
-      busy: false
+      busy: false,
+      viewMode: 'media',
+      fsCurrentPath: 'DCIM',
+      fsParentPath: '/',
+      fsEntries: [],
+      fsSelected: new Set()
     };
 
     const summary = document.getElementById('summary');
+    const fsSummary = document.getElementById('fsSummary');
     const status = document.getElementById('status');
     const progressBar = document.getElementById('progressBar');
     const grid = document.getElementById('grid');
+    const fsList = document.getElementById('fsList');
+    const mediaView = document.getElementById('mediaView');
+    const fsView = document.getElementById('fsView');
     const destinationInput = document.getElementById('destination');
+    const viewModeInput = document.getElementById('viewMode');
     const filterInput = document.getElementById('filter');
     const includeAdditionalRootsInput = document.getElementById('includeAdditionalRoots');
+    const scanButton = document.getElementById('scanButton');
     const copyButton = document.getElementById('copyButton');
     const moveButton = document.getElementById('moveButton');
-    const refreshButton = document.getElementById('refreshButton');
+    const fsCopyButton = document.getElementById('fsCopyButton');
+    const fsMoveButton = document.getElementById('fsMoveButton');
+    const fsDeleteButton = document.getElementById('fsDeleteButton');
+    const fsRefreshButton = document.getElementById('fsRefreshButton');
+    const fsPathInput = document.getElementById('fsPath');
+    const fsOpenButton = document.getElementById('fsOpenButton');
+    const fsUpButton = document.getElementById('fsUpButton');
 
     filterInput.addEventListener('change', () => {
       state.filter = filterInput.value;
@@ -1362,18 +1752,36 @@ internal static class UiPage
       renderSummary();
     });
 
-    includeAdditionalRootsInput.addEventListener('change', () => loadMedia());
-    refreshButton.addEventListener('click', () => loadMedia());
+    viewModeInput.addEventListener('change', () => setViewMode(viewModeInput.value));
+    scanButton.addEventListener('click', () => loadMedia());
     copyButton.addEventListener('click', () => transfer('copy'));
     moveButton.addEventListener('click', () => transfer('move'));
+    fsCopyButton.addEventListener('click', () => transferFs('copy'));
+    fsMoveButton.addEventListener('click', () => transferFs('move'));
+    fsDeleteButton.addEventListener('click', () => transferFs('delete'));
+    fsRefreshButton.addEventListener('click', () => loadFs(state.fsCurrentPath));
+    fsOpenButton.addEventListener('click', () => loadFs(fsPathInput.value));
+    fsUpButton.addEventListener('click', () => {
+      if (state.fsParentPath) {
+        loadFs(state.fsParentPath);
+      }
+    });
 
     function setBusy(value) {
       state.busy = value;
       copyButton.disabled = value;
       moveButton.disabled = value;
-      refreshButton.disabled = value;
+      scanButton.disabled = value;
+      fsCopyButton.disabled = value;
+      fsMoveButton.disabled = value;
+      fsDeleteButton.disabled = value;
+      fsRefreshButton.disabled = value;
+      fsOpenButton.disabled = value;
+      fsUpButton.disabled = value || !state.fsParentPath;
       filterInput.disabled = value;
       includeAdditionalRootsInput.disabled = value;
+      viewModeInput.disabled = value;
+      fsPathInput.disabled = value;
       progressBar.classList.toggle('active', value);
     }
 
@@ -1382,12 +1790,41 @@ internal static class UiPage
       status.classList.toggle('error', isError);
     }
 
+    function setViewMode(mode) {
+      state.viewMode = mode === 'filesystem' ? 'filesystem' : 'media';
+      const fsMode = state.viewMode === 'filesystem';
+      mediaView.classList.toggle('hidden', fsMode);
+      fsView.classList.toggle('hidden', !fsMode);
+      filterInput.classList.toggle('hidden', fsMode);
+      scanButton.classList.toggle('hidden', fsMode);
+      copyButton.classList.toggle('hidden', fsMode);
+      moveButton.classList.toggle('hidden', fsMode);
+      fsCopyButton.classList.toggle('hidden', !fsMode);
+      fsMoveButton.classList.toggle('hidden', !fsMode);
+      fsDeleteButton.classList.toggle('hidden', !fsMode);
+      fsRefreshButton.classList.toggle('hidden', !fsMode);
+      fsUpButton.disabled = state.busy || !state.fsParentPath;
+
+      if (fsMode && state.fsEntries.length === 0) {
+        loadFs(state.fsCurrentPath);
+        return;
+      }
+
+      setStatus(fsMode
+        ? 'File system view: open a folder and select files or folders to copy, move, or delete.'
+        : 'Media view: choose options and click Scan Media to start.');
+    }
+
     function filteredItems() {
       if (state.filter === 'all') {
         return state.items;
       }
 
       return state.items.filter(item => item.kind === state.filter);
+    }
+
+    function chip(text) {
+      return `<div class="chip">${text}</div>`;
     }
 
     function renderSummary() {
@@ -1408,15 +1845,23 @@ internal static class UiPage
       ].join('');
     }
 
-    function chip(text) {
-      return `<div class="chip">${text}</div>`;
+    function renderFsSummary() {
+      const folderCount = state.fsEntries.filter(entry => entry.isDirectory).length;
+      const fileCount = state.fsEntries.filter(entry => entry.isFile).length;
+      fsSummary.innerHTML = [
+        chip(`Path: ${state.fsCurrentPath}`),
+        chip(`${folderCount} folders`),
+        chip(`${fileCount} files`),
+        chip(`${state.fsSelected.size} selected`)
+      ].join('');
+      fsUpButton.disabled = state.busy || !state.fsParentPath;
     }
 
     function renderGrid() {
       const visible = filteredItems();
 
       if (visible.length === 0) {
-        grid.innerHTML = '<div class="empty">No matching media was found.</div>';
+        grid.innerHTML = '<div class="empty">No matching media was found. Click Scan Media to load items.</div>';
         return;
       }
 
@@ -1487,6 +1932,59 @@ internal static class UiPage
       }
     }
 
+    function renderFsList() {
+      if (state.fsEntries.length === 0) {
+        fsList.innerHTML = '<div class="empty">No entries were found in this folder.</div>';
+        return;
+      }
+
+      fsList.innerHTML = '';
+      for (const entry of state.fsEntries) {
+        const row = document.createElement('div');
+        row.className = 'fs-row';
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = state.fsSelected.has(entry.path);
+        checkbox.addEventListener('change', () => {
+          if (checkbox.checked) {
+            state.fsSelected.add(entry.path);
+          } else {
+            state.fsSelected.delete(entry.path);
+          }
+          renderFsSummary();
+        });
+
+        const info = document.createElement('div');
+        info.innerHTML = `
+          <div><strong>${escapeHtml(entry.name)}</strong></div>
+          <div class="path">${escapeHtml(entry.path)}</div>
+        `;
+
+        const controls = document.createElement('div');
+        controls.className = 'meta';
+        controls.textContent = entry.isDirectory
+          ? 'Folder'
+          : `${formatBytes(entry.sizeBytes ?? 0)}`;
+
+        if (entry.isDirectory) {
+          const openButton = document.createElement('button');
+          openButton.textContent = 'Open';
+          openButton.addEventListener('click', event => {
+            event.preventDefault();
+            loadFs(entry.path);
+          });
+          controls.innerHTML = '';
+          controls.appendChild(openButton);
+        }
+
+        row.appendChild(checkbox);
+        row.appendChild(info);
+        row.appendChild(controls);
+        fsList.appendChild(row);
+      }
+    }
+
     function buildImageFallbackMarkup(item) {
       return `<div class="video-preview"><div class="fallback-icon">${escapeHtml(getFileExtension(item))}</div></div>`;
     }
@@ -1527,7 +2025,7 @@ internal static class UiPage
 
     async function loadMedia() {
       setBusy(true);
-      setStatus('Loading media from the device…');
+      setStatus('Scanning media from the device…');
 
       try {
         const response = await fetch(`/api/media?includeAdditionalRoots=${includeAdditionalRootsInput.checked}`);
@@ -1553,9 +2051,46 @@ internal static class UiPage
       }
     }
 
+    async function loadFs(path) {
+      const requestedPath = (path || fsPathInput.value || 'DCIM').trim();
+      if (!requestedPath) {
+        setStatus('Enter a folder path to open.', true);
+        fsPathInput.focus();
+        return;
+      }
+
+      setBusy(true);
+      setStatus(`Loading folder ${requestedPath}…`);
+
+      try {
+        const response = await fetch(`/api/fs?path=${encodeURIComponent(requestedPath)}`);
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.message || 'Unable to load folder.');
+        }
+
+        state.fsCurrentPath = data.currentPath;
+        state.fsParentPath = data.parentPath;
+        state.fsEntries = data.entries || [];
+        state.fsSelected.clear();
+        fsPathInput.value = data.currentPath;
+        renderFsSummary();
+        renderFsList();
+        setStatus(`Loaded ${state.fsEntries.length} entries from ${data.currentPath}.`);
+      } catch (error) {
+        state.fsEntries = [];
+        state.fsSelected.clear();
+        renderFsSummary();
+        renderFsList();
+        setStatus(error.message, true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
     async function transfer(operation) {
       if (state.selected.size === 0) {
-        setStatus('Select at least one item first.', true);
+        setStatus('Select at least one media item first.', true);
         return;
       }
 
@@ -1571,7 +2106,7 @@ internal static class UiPage
       }
 
       setBusy(true);
-      setStatus(`${operation === 'move' ? 'Moving' : 'Copying'} selected items…`);
+      setStatus(`${operation === 'move' ? 'Moving' : 'Copying'} selected media items…`);
 
       try {
         const response = await fetch('/api/transfer', {
@@ -1599,6 +2134,64 @@ internal static class UiPage
       }
     }
 
+    async function transferFs(operation) {
+      if (state.fsSelected.size === 0) {
+        setStatus('Select at least one file or folder first.', true);
+        return;
+      }
+
+      const destinationDirectory = destinationInput.value.trim();
+      if (operation !== 'delete' && !destinationDirectory) {
+        setStatus('Enter an absolute destination directory path first.', true);
+        destinationInput.focus();
+        return;
+      }
+
+      if (operation === 'move' && !window.confirm('Move deletes the selected remote files and folders after hash-verified copy. Continue?')) {
+        return;
+      }
+
+      if (operation === 'delete' && !window.confirm('Delete permanently removes the selected remote files and folders. Continue?')) {
+        return;
+      }
+
+      setBusy(true);
+      setStatus(`${operation[0].toUpperCase() + operation.slice(1)} selected file system items…`);
+
+      try {
+        const response = await fetch('/api/fs/transfer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            selectedPaths: Array.from(state.fsSelected),
+            destinationDirectory: operation === 'delete' ? null : destinationDirectory,
+            operation
+          })
+        });
+
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.message || 'File system transfer failed.');
+        }
+
+        const countNote = operation === 'delete' ? '' : ` ${data.localPaths.length} file(s) written.`;
+        setStatus(`${data.message}${countNote}`);
+        await loadFs(state.fsCurrentPath);
+      } catch (error) {
+        setStatus(error.message, true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    function formatBytes(value) {
+      const bytes = Number(value) || 0;
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+      if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+      return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+    }
+
     function formatDuration(durationInSeconds) {
       const totalSeconds = Math.max(0, Math.round(durationInSeconds));
       const hours = Math.floor(totalSeconds / 3600);
@@ -1613,7 +2206,8 @@ internal static class UiPage
     }
 
     function escapeHtml(value) {
-      return value
+      return (value ?? '')
+        .toString()
         .replaceAll('&', '&amp;')
         .replaceAll('<', '&lt;')
         .replaceAll('>', '&gt;')
@@ -1621,7 +2215,11 @@ internal static class UiPage
         .replaceAll("'", '&#39;');
     }
 
-    loadMedia();
+    renderSummary();
+    renderGrid();
+    renderFsSummary();
+    renderFsList();
+    setViewMode('media');
   </script>
 </body>
 </html>
