@@ -1929,12 +1929,13 @@ internal static class UiPage
       background: var(--panel);
       border-radius: 20px;
       box-shadow: var(--shadow);
-      padding: 24px;
       min-width: 320px;
-      max-width: 460px;
-      width: 90%;
-      display: grid;
-      gap: 16px;
+      max-width: 720px;
+      width: 92%;
+      max-height: 88vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
     }
     .modal-title {
       margin: 0;
@@ -1942,8 +1943,87 @@ internal static class UiPage
       display: flex;
       align-items: center;
       gap: 8px;
+      padding: 20px 24px 16px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
     }
-    .modal-footer { display: flex; gap: 10px; justify-content: flex-end; }
+    .modal-body {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+    .settings-nav {
+      width: 180px;
+      flex-shrink: 0;
+      padding: 12px 8px;
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .settings-nav-item {
+      padding: 9px 14px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: .95rem;
+      color: var(--text);
+      background: none;
+      border: 0;
+      text-align: left;
+      width: 100%;
+      transition: background .12s ease, color .12s ease;
+    }
+    .settings-nav-item:hover { background: var(--border); }
+    .settings-nav-item.active { background: var(--border); font-weight: 600; }
+    .settings-panels {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 24px;
+    }
+    .settings-panel { display: none; }
+    .settings-panel.active { display: block; }
+    .settings-panel-title {
+      font-size: 1rem;
+      font-weight: 700;
+      margin: 0 0 16px;
+      color: var(--accent);
+    }
+    .settings-section {
+      margin-bottom: 20px;
+    }
+    .settings-section-title {
+      font-size: .92rem;
+      font-weight: 600;
+      margin: 0 0 4px;
+      color: var(--text);
+    }
+    .settings-section-hint {
+      font-size: .82rem;
+      color: var(--muted);
+      margin: 0 0 10px;
+    }
+    .settings-check-row, .settings-radio-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 0;
+      font-size: .92rem;
+      cursor: pointer;
+    }
+    .settings-check-row input, .settings-radio-row input {
+      width: 18px;
+      height: 18px;
+      accent-color: var(--accent);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .settings-radio-hint {
+      font-size: .8rem;
+      color: var(--muted);
+      margin-left: 4px;
+    }
+    .modal-footer { display: flex; gap: 10px; justify-content: flex-end; padding: 14px 24px; border-top: 1px solid var(--border); flex-shrink: 0; }
     .setting-row {
       display: grid;
       gap: 6px;
@@ -2073,13 +2153,93 @@ internal static class UiPage
   <div class="modal-overlay" id="settingsOverlay" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
     <div class="modal">
       <h2 class="modal-title" id="settingsTitle">⚙ Settings</h2>
-      <div class="setting-row">
-        <div class="setting-label">
-          <strong>Parallel transfers</strong>
-          <span class="setting-value" id="parallelismValue">4</span>
+      <div class="modal-body">
+        <nav class="settings-nav" aria-label="Settings navigation">
+          <button class="settings-nav-item active" data-panel="general">General</button>
+          <button class="settings-nav-item" data-panel="photos">Photos</button>
+        </nav>
+        <div class="settings-panels">
+
+          <!-- General panel -->
+          <div class="settings-panel active" id="panel-general">
+            <p class="settings-panel-title">General</p>
+            <div class="setting-row">
+              <div class="setting-label">
+                <strong>Parallel transfers</strong>
+                <span class="setting-value" id="parallelismValue">4</span>
+              </div>
+              <div class="setting-hint">Number of files to copy, move, or delete simultaneously (1–16).</div>
+              <input type="range" id="parallelismInput" min="1" max="16" value="4" aria-label="Parallel transfers">
+            </div>
+          </div>
+
+          <!-- Photos panel -->
+          <div class="settings-panel" id="panel-photos">
+            <p class="settings-panel-title">Photos</p>
+
+            <div class="settings-section">
+              <p class="settings-section-title">Edited Photos:</p>
+              <p class="settings-section-hint">Includes filters or adjustments to saturation, contrast, brightness, or aspect ratio</p>
+              <label class="settings-check-row">
+                <input type="checkbox" id="settingExportOriginal" checked>
+                Export Original Photo
+              </label>
+              <label class="settings-check-row">
+                <input type="checkbox" id="settingExportEdited" checked>
+                Export Edited Version
+              </label>
+            </div>
+
+            <div class="settings-section">
+              <p class="settings-section-title">Photo Export Naming Method</p>
+              <label class="settings-radio-row">
+                <input type="radio" name="photoNaming" id="settingNamingOriginal" value="original">
+                Original Filename
+              </label>
+              <label class="settings-radio-row">
+                <input type="radio" name="photoNaming" id="settingNamingDatetime" value="datetime" checked>
+                Name by Capture Date/Time
+              </label>
+            </div>
+
+            <div class="settings-section">
+              <p class="settings-section-title">Live Photo Viewing Mode</p>
+              <label class="settings-radio-row">
+                <input type="radio" name="livePhotoMode" id="settingLiveStatic" value="static" checked>
+                Static
+              </label>
+              <label class="settings-radio-row">
+                <input type="radio" name="livePhotoMode" id="settingLiveDynamic" value="dynamic">
+                Dynamic
+              </label>
+            </div>
+
+            <div class="settings-section">
+              <p class="settings-section-title">Live Photo Export Files</p>
+              <label class="settings-radio-row">
+                <input type="radio" name="livePhotoExport" id="settingLiveImageVideo" value="image+video" checked>
+                Image + Video
+              </label>
+              <label class="settings-radio-row">
+                <input type="radio" name="livePhotoExport" id="settingLiveImageOnly" value="image">
+                Image Only
+              </label>
+            </div>
+
+            <div class="settings-section">
+              <p class="settings-section-title">HEIC Photo Export Format</p>
+              <label class="settings-radio-row">
+                <input type="radio" name="heicFormat" id="settingHeicJpg" value="jpg">
+                JPG
+              </label>
+              <label class="settings-radio-row">
+                <input type="radio" name="heicFormat" id="settingHeicHeic" value="heic" checked>
+                HEIC <span class="settings-radio-hint">ⓘ Apple-specific format, may not be viewable in regular viewers</span>
+              </label>
+            </div>
+          </div>
+
         </div>
-        <div class="setting-hint">Number of files to copy, move, or delete simultaneously (1–16).</div>
-        <input type="range" id="parallelismInput" min="1" max="16" value="4" aria-label="Parallel transfers">
       </div>
       <div class="modal-footer">
         <button class="primary" id="settingsCloseButton">Done</button>
@@ -2098,7 +2258,15 @@ internal static class UiPage
       localStorage.setItem(settingsStorageKey, JSON.stringify(settings));
     }
 
-    const settings = Object.assign({ parallelism: 4 }, loadSettings());
+    const settings = Object.assign({
+      parallelism: 4,
+      exportOriginalPhoto: true,
+      exportEditedVersion: true,
+      photoNaming: 'datetime',
+      livePhotoViewingMode: 'static',
+      livePhotoExportFiles: 'image+video',
+      heicExportFormat: 'heic'
+    }, loadSettings());
 
     const state = {
       items: [],
@@ -2139,6 +2307,16 @@ internal static class UiPage
     const settingsCloseButton = document.getElementById('settingsCloseButton');
     const parallelismInput = document.getElementById('parallelismInput');
     const parallelismValue = document.getElementById('parallelismValue');
+    const settingExportOriginal = document.getElementById('settingExportOriginal');
+    const settingExportEdited = document.getElementById('settingExportEdited');
+    const settingNamingOriginal = document.getElementById('settingNamingOriginal');
+    const settingNamingDatetime = document.getElementById('settingNamingDatetime');
+    const settingLiveStatic = document.getElementById('settingLiveStatic');
+    const settingLiveDynamic = document.getElementById('settingLiveDynamic');
+    const settingLiveImageVideo = document.getElementById('settingLiveImageVideo');
+    const settingLiveImageOnly = document.getElementById('settingLiveImageOnly');
+    const settingHeicJpg = document.getElementById('settingHeicJpg');
+    const settingHeicHeic = document.getElementById('settingHeicHeic');
     const queuePanel = document.getElementById('queuePanel');
     const queueList = document.getElementById('queueList');
     const queueTitle = document.getElementById('queueTitle');
@@ -2179,6 +2357,20 @@ internal static class UiPage
       parallelismValue.textContent = settings.parallelism;
       saveSettings();
     });
+    settingExportOriginal.addEventListener('change', () => { settings.exportOriginalPhoto = settingExportOriginal.checked; saveSettings(); });
+    settingExportEdited.addEventListener('change', () => { settings.exportEditedVersion = settingExportEdited.checked; saveSettings(); });
+    document.querySelectorAll('input[name="photoNaming"]').forEach(r => r.addEventListener('change', () => { settings.photoNaming = r.value; saveSettings(); }));
+    document.querySelectorAll('input[name="livePhotoMode"]').forEach(r => r.addEventListener('change', () => { settings.livePhotoViewingMode = r.value; saveSettings(); }));
+    document.querySelectorAll('input[name="livePhotoExport"]').forEach(r => r.addEventListener('change', () => { settings.livePhotoExportFiles = r.value; saveSettings(); }));
+    document.querySelectorAll('input[name="heicFormat"]').forEach(r => r.addEventListener('change', () => { settings.heicExportFormat = r.value; saveSettings(); }));
+    document.querySelectorAll('.settings-nav-item').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.settings-nav-item').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.settings-panel').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('panel-' + btn.dataset.panel).classList.add('active');
+      });
+    });
     retryAllButton.addEventListener('click', () => retryQueueItems(null));
     clearQueueButton.addEventListener('click', () => clearQueue());
 
@@ -2208,6 +2400,16 @@ internal static class UiPage
     function openSettings() {
       parallelismInput.value = settings.parallelism;
       parallelismValue.textContent = settings.parallelism;
+      settingExportOriginal.checked = settings.exportOriginalPhoto;
+      settingExportEdited.checked = settings.exportEditedVersion;
+      settingNamingOriginal.checked = settings.photoNaming === 'original';
+      settingNamingDatetime.checked = settings.photoNaming === 'datetime';
+      settingLiveStatic.checked = settings.livePhotoViewingMode === 'static';
+      settingLiveDynamic.checked = settings.livePhotoViewingMode === 'dynamic';
+      settingLiveImageVideo.checked = settings.livePhotoExportFiles === 'image+video';
+      settingLiveImageOnly.checked = settings.livePhotoExportFiles === 'image';
+      settingHeicJpg.checked = settings.heicExportFormat === 'jpg';
+      settingHeicHeic.checked = settings.heicExportFormat === 'heic';
       settingsOverlay.classList.add('active');
       settingsCloseButton.focus();
     }
