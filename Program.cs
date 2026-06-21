@@ -2,11 +2,17 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 
 bool deleteSourceAfterCopy = false;
+bool listRemotePath = false;
 int firstPathArgumentIndex = 0;
 
 if (args.Length > 0)
 {
-    if (args[0] is "--move" or "move")
+    if (args[0] is "--list" or "list")
+    {
+        listRemotePath = true;
+        firstPathArgumentIndex = 1;
+    }
+    else if (args[0] is "--move" or "move")
     {
         deleteSourceAfterCopy = true;
         firstPathArgumentIndex = 1;
@@ -17,15 +23,33 @@ if (args.Length > 0)
     }
 }
 
-if (args.Length - firstPathArgumentIndex < 2 || args.Length - firstPathArgumentIndex > 3)
-{
-    WriteUsage();
-    return 1;
-}
+string remotePath;
+string? localPath = null;
+string? udid;
 
-string remotePath = args[firstPathArgumentIndex];
-string localPath = args[firstPathArgumentIndex + 1];
-string? udid = args.Length - firstPathArgumentIndex == 3 ? args[firstPathArgumentIndex + 2] : null;
+if (listRemotePath)
+{
+    if (args.Length - firstPathArgumentIndex < 1 || args.Length - firstPathArgumentIndex > 2)
+    {
+        WriteUsage();
+        return 1;
+    }
+
+    remotePath = args[firstPathArgumentIndex];
+    udid = args.Length - firstPathArgumentIndex == 2 ? args[firstPathArgumentIndex + 1] : null;
+}
+else
+{
+    if (args.Length - firstPathArgumentIndex < 2 || args.Length - firstPathArgumentIndex > 3)
+    {
+        WriteUsage();
+        return 1;
+    }
+
+    remotePath = args[firstPathArgumentIndex];
+    localPath = args[firstPathArgumentIndex + 1];
+    udid = args.Length - firstPathArgumentIndex == 3 ? args[firstPathArgumentIndex + 2] : null;
+}
 
 IntPtr device = IntPtr.Zero;
 IntPtr lockdowndClient = IntPtr.Zero;
@@ -47,6 +71,17 @@ try
     );
 
     ThrowIfError(NativeMethods.afc_client_new(device, serviceDescriptor, ref afcClient), "Unable to create AFC client");
+
+    if (listRemotePath)
+    {
+        ListRemoteDirectory(afcClient, remotePath);
+        return 0;
+    }
+
+    if (localPath is null)
+    {
+        throw new InvalidOperationException("Local output path is required for copy and move modes.");
+    }
 
     byte[] sourceHash = CopyRemoteFileToLocalAndComputeHash(afcClient, remotePath, localPath);
 
@@ -100,8 +135,58 @@ finally
 static void WriteUsage()
 {
     Console.WriteLine("Usage:");
+    Console.WriteLine("  AppleFileConduitDemo [list|--list] <remoteDirectoryPath> [deviceUdid]");
     Console.WriteLine("  AppleFileConduitDemo [copy|--copy] <remoteFilePath> <localOutputPath> [deviceUdid]");
     Console.WriteLine("  AppleFileConduitDemo [move|--move] <remoteFilePath> <localOutputPath> [deviceUdid]");
+}
+
+static void ListRemoteDirectory(IntPtr afcClient, string remotePath)
+{
+    IntPtr directoryEntries = IntPtr.Zero;
+    ThrowIfError(
+        NativeMethods.afc_read_directory(afcClient, remotePath, ref directoryEntries),
+        $"Unable to list remote directory '{remotePath}'"
+    );
+
+    try
+    {
+        Console.WriteLine($"Listing '{remotePath}':");
+
+        nint offset = 0;
+        bool hasVisibleEntries = false;
+
+        while (true)
+        {
+            IntPtr entryPointer = Marshal.ReadIntPtr(directoryEntries, (int)offset);
+            if (entryPointer == IntPtr.Zero)
+            {
+                break;
+            }
+
+            string? entry = Marshal.PtrToStringUTF8(entryPointer);
+            offset += IntPtr.Size;
+
+            if (string.IsNullOrEmpty(entry) || entry is "." or "..")
+            {
+                continue;
+            }
+
+            hasVisibleEntries = true;
+            Console.WriteLine(entry);
+        }
+
+        if (!hasVisibleEntries)
+        {
+            Console.WriteLine("(empty)");
+        }
+    }
+    finally
+    {
+        if (directoryEntries != IntPtr.Zero)
+        {
+            NativeMethods.afc_dictionary_free(directoryEntries);
+        }
+    }
 }
 
 static byte[] CopyRemoteFileToLocalAndComputeHash(IntPtr afcClient, string remotePath, string localPath)
@@ -226,4 +311,14 @@ internal static class NativeMethods
 
     [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
     public static extern int afc_remove_path(IntPtr afcClient, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+
+    [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int afc_read_directory(
+        IntPtr afcClient,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        ref IntPtr directoryEntries
+    );
+
+    [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void afc_dictionary_free(IntPtr dictionary);
 }
