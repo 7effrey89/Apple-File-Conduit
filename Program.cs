@@ -752,6 +752,15 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             return;
         }
 
+        if (path == "/api/cache/reset" && context.Request.HttpMethod == "POST")
+        {
+            MediaIndexStore.PtpFallbackState.Clear(udid);
+            MediaIndexStore.MarkDirty(udid);
+            AfcMetadataCache.InvalidateAll(udid);
+            await WriteJsonResponseAsync(context.Response, new { message = "Cache reset. The next load will fetch fresh data." });
+            return;
+        }
+
         context.Response.StatusCode = (int)HttpStatusCode.NotFound;
         await WriteJsonResponseAsync(context.Response, new ErrorResponse("The requested resource was not found."));
     }
@@ -2694,6 +2703,26 @@ internal static class AfcMetadataCache
         }
     }
 
+    public static void InvalidateAll(string? udid)
+    {
+        string cachePrefix = $"{GetDeviceKey(udid)}|";
+        foreach ((string key, _) in EntryInfos)
+        {
+            if (key.StartsWith(cachePrefix, StringComparison.Ordinal))
+            {
+                EntryInfos.TryRemove(key, out _);
+            }
+        }
+
+        foreach ((string key, _) in DirectoryEntries)
+        {
+            if (key.StartsWith(cachePrefix, StringComparison.Ordinal))
+            {
+                DirectoryEntries.TryRemove(key, out _);
+            }
+        }
+    }
+
     private static string BuildCacheKey(string? udid, string normalizedPath) => $"{GetDeviceKey(udid)}|{normalizedPath}";
 
     private static string GetDeviceKey(string? udid) => string.IsNullOrWhiteSpace(udid) ? "default-device" : udid.Trim();
@@ -3538,6 +3567,7 @@ internal static class UiPage
         <span>Include PhotoData</span>
       </label>
       <button id="scanButton">Scan Media</button>
+      <button id="resetCacheButton" title="Clear cached media and file-system metadata for this device">Reset Cache</button>
       <button class="hidden" id="retryPtpButton" title="Clear the PTP retry cooldown and scan again using PTP">Retry PTP</button>
       <button class="primary" id="copyButton">Copy Selected</button>
       <button class="danger" id="moveButton">Move Selected</button>
@@ -3728,6 +3758,7 @@ internal static class UiPage
     const filterInput = document.getElementById('filter');
     const includeAdditionalRootsInput = document.getElementById('includeAdditionalRoots');
     const scanButton = document.getElementById('scanButton');
+    const resetCacheButton = document.getElementById('resetCacheButton');
     const retryPtpButton = document.getElementById('retryPtpButton');
     const copyButton = document.getElementById('copyButton');
     const moveButton = document.getElementById('moveButton');
@@ -3770,6 +3801,7 @@ internal static class UiPage
 
     viewModeInput.addEventListener('change', () => setViewMode(viewModeInput.value));
     scanButton.addEventListener('click', () => loadMedia());
+    resetCacheButton.addEventListener('click', () => resetCache());
     retryPtpButton.addEventListener('click', () => retryPtp());
     copyButton.addEventListener('click', () => transfer('copy'));
     moveButton.addEventListener('click', () => transfer('move'));
@@ -3819,6 +3851,7 @@ internal static class UiPage
       copyButton.disabled = value;
       moveButton.disabled = value;
       scanButton.disabled = value;
+      resetCacheButton.disabled = value;
       retryPtpButton.disabled = value;
       fsCopyButton.disabled = value;
       fsMoveButton.disabled = value;
@@ -4368,6 +4401,27 @@ internal static class UiPage
         await fetch('/api/ptp-retry', { method: 'POST' });
       } catch { }
       await loadMedia();
+    }
+
+    async function resetCache() {
+      setBusy(true);
+      setStatus('Resetting cache…');
+      try {
+        const response = await fetch('/api/cache/reset', { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.message || 'Unable to reset cache.');
+        }
+        if (state.viewMode === 'filesystem') {
+          await loadFs(state.fsCurrentPath || 'DCIM');
+        } else {
+          await loadMedia();
+        }
+      } catch (error) {
+        setStatus(error.message, true);
+      } finally {
+        setBusy(false);
+      }
     }
 
     async function loadFs(path) {
