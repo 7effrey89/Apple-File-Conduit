@@ -1,6 +1,6 @@
 # Apple-File-Conduit
 
-Minimal C# console demo that copies a file from an iPhone using Apple's AFC service via the open-source `libimobiledevice` stack.
+Minimal C# app that can either run AFC copy/list/move commands directly or launch a local browser UI for browsing photos, live photos, and videos from an iPhone via the open-source `libimobiledevice` stack.
 
 ## Prerequisites
 
@@ -39,7 +39,16 @@ dotnet build /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileCo
 dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [list|--list] <remoteDirectoryPath> [deviceUdid]
 dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [copy|--copy] <remoteFilePath> <localOutputPath> [deviceUdid]
 dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [move|--move] <remoteFilePath> <localOutputPath> [deviceUdid]
+dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [ui|--ui] [deviceUdid]
 ```
+
+### UI example
+
+```bash
+dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- ui
+```
+
+The UI starts a local web server, opens a browser, loads media from the iPhone `DCIM` folders, labels photo/live photo/video items, and lets you copy or move the selected items to an absolute destination folder on the computer.
 
 ### List example
 
