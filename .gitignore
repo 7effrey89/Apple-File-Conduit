@@ -1,2 +1,26 @@
+# Build output
 bin/
 obj/
+artifacts/
+
+# User-specific IDE/editor files
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Debug/log/cache files
+*.log
+*.tmp
+*.cache
+
+# NuGet/package restore artifacts
+packages/
+
+# Runtime-generated app data
+failed-transfers.json
+
+# Local scratch/temporary files
+bing_*_search.html

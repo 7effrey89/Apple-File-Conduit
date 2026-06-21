@@ -46,6 +46,21 @@ dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/App
 dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [copy|--copy] <remoteFilePath> <localOutputPath> [deviceUdid]
 dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [move|--move] <remoteFilePath> <localOutputPath> [deviceUdid]
 dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [ui|--ui] [deviceUdid]
+dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [ptp-test|--ptp-test] [--continuous] [--interval <seconds>] [deviceUdid]
+```
+
+### PTP diagnostic examples
+
+One-shot PTP probe:
+
+```bash
+dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- ptp-test
+```
+
+Continuous PTP probe every 3 seconds (Ctrl+C to stop):
+
+```bash
+dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- ptp-test --continuous --interval 3
 ```
 
 ### UI example

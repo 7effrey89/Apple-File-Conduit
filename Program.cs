@@ -8,6 +8,8 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Globalization;
+using ImageMagick;
 
 return await MainAsync(args);
 
@@ -16,6 +18,7 @@ static async Task<int> MainAsync(string[] args)
     bool deleteSourceAfterCopy = false;
     bool listRemotePath = false;
     bool launchUi = false;
+  bool runPtpTest = false;
     int firstPathArgumentIndex = 0;
 
     if (args.Length > 0)
@@ -39,11 +42,74 @@ static async Task<int> MainAsync(string[] args)
             launchUi = true;
             firstPathArgumentIndex = 1;
         }
+        else if (args[0] is "--ptp-test" or "ptp-test")
+        {
+          runPtpTest = true;
+          firstPathArgumentIndex = 1;
+        }
     }
 
     string remotePath;
     string? localPath = null;
     string? udid;
+
+      if (runPtpTest)
+      {
+        bool continuous = false;
+        int intervalSeconds = 3;
+        string? ptpUdid = null;
+
+        for (int index = firstPathArgumentIndex; index < args.Length; index++)
+        {
+          string argument = args[index];
+
+          if (argument is "--continuous" or "-c")
+          {
+            continuous = true;
+            continue;
+          }
+
+          if (argument.StartsWith("--interval=", StringComparison.Ordinal))
+          {
+            if (!int.TryParse(argument["--interval=".Length..], out intervalSeconds) || intervalSeconds < 1)
+            {
+              Console.Error.WriteLine("Invalid --interval value. Use a positive integer number of seconds.");
+              return 1;
+            }
+
+            continue;
+          }
+
+          if (argument == "--interval")
+          {
+            if (index + 1 >= args.Length || !int.TryParse(args[index + 1], out intervalSeconds) || intervalSeconds < 1)
+            {
+              Console.Error.WriteLine("Invalid --interval value. Use a positive integer number of seconds.");
+              return 1;
+            }
+
+            index++;
+            continue;
+          }
+
+          if (argument.StartsWith("--udid=", StringComparison.Ordinal))
+          {
+            ptpUdid = argument["--udid=".Length..];
+            continue;
+          }
+
+          if (ptpUdid is null)
+          {
+            ptpUdid = argument;
+            continue;
+          }
+
+          WriteUsage();
+          return 1;
+        }
+
+        return await RunPtpDiagnosticAsync(ptpUdid, continuous, TimeSpan.FromSeconds(intervalSeconds));
+      }
 
     if (launchUi)
     {
@@ -123,6 +189,143 @@ static async Task<int> MainAsync(string[] args)
         return 1;
     }
 }
+
+static async Task<int> RunPtpDiagnosticAsync(string? udid, bool continuous, TimeSpan interval)
+{
+  if (!continuous)
+  {
+    bool success = RunPtpDiagnosticOnce(udid, out string resultLine);
+    Console.WriteLine(resultLine);
+    return success ? 0 : 1;
+  }
+
+  using CancellationTokenSource stop = new();
+  int totalRuns = 0;
+  int passedRuns = 0;
+  int failedRuns = 0;
+
+  void StopLoop(object? _, ConsoleCancelEventArgs eventArgs)
+  {
+    eventArgs.Cancel = true;
+    stop.Cancel();
+  }
+
+  Console.CancelKeyPress += StopLoop;
+  Console.WriteLine($"Running continuous PTP diagnostic every {interval.TotalSeconds:0} second(s). Press Ctrl+C to stop.");
+
+  try
+  {
+    while (!stop.IsCancellationRequested)
+    {
+      totalRuns++;
+      bool success = RunPtpDiagnosticOnce(udid, out string resultLine);
+      if (success)
+      {
+        passedRuns++;
+      }
+      else
+      {
+        failedRuns++;
+      }
+
+      Console.WriteLine(resultLine);
+
+      try
+      {
+        await Task.Delay(interval, stop.Token);
+      }
+      catch (OperationCanceledException)
+      {
+        break;
+      }
+    }
+  }
+  finally
+  {
+    Console.CancelKeyPress -= StopLoop;
+  }
+
+  Console.WriteLine($"PTP diagnostic summary: {passedRuns}/{totalRuns} passed, {failedRuns}/{totalRuns} failed.");
+  return passedRuns > 0 ? 0 : 1;
+}
+
+static bool RunPtpDiagnosticOnce(string? udid, out string resultLine)
+{
+  Stopwatch stopwatch = Stopwatch.StartNew();
+
+  try
+  {
+    using PtpSession session = PtpSession.Connect(udid);
+    session.OpenSession();
+
+    uint[] storageIds = session.GetStorageIds();
+    int totalObjects = 0;
+    uint? sampleHandle = null;
+
+    foreach (uint storageId in storageIds)
+    {
+      uint[] handles = session.GetObjectHandles(storageId);
+      totalObjects += handles.Length;
+
+      if (!sampleHandle.HasValue && handles.Length > 0)
+      {
+        sampleHandle = handles[0];
+      }
+    }
+
+    if (sampleHandle.HasValue)
+    {
+      _ = session.GetObjectInfo(sampleHandle.Value);
+    }
+
+    stopwatch.Stop();
+    resultLine = $"[{DateTimeOffset.Now:HH:mm:ss}] PASS PTP connected. Storages={storageIds.Length}, Objects={totalObjects}, Duration={stopwatch.ElapsedMilliseconds}ms.";
+    return true;
+  }
+  catch (Exception ex)
+  {
+    stopwatch.Stop();
+    bool messageIncludesNativeCode = ex.Message.Contains("Native error code:", StringComparison.Ordinal);
+    string nativeErrorSuffix = !messageIncludesNativeCode && TryGetNativeErrorCode(ex, out int errorCode)
+      ? $" Native error code: {errorCode}."
+      : string.Empty;
+    resultLine = $"[{DateTimeOffset.Now:HH:mm:ss}] FAIL PTP diagnostic after {stopwatch.ElapsedMilliseconds}ms. {ex.Message}{nativeErrorSuffix}";
+    return false;
+  }
+}
+
+  static PtpStatusResponse GetPtpStatus(string? udid)
+  {
+    Stopwatch stopwatch = Stopwatch.StartNew();
+
+    try
+    {
+      using PtpSession session = PtpSession.Connect(udid);
+      session.OpenSession();
+      int storageCount = session.GetStorageIds().Length;
+
+      stopwatch.Stop();
+      return new PtpStatusResponse(
+        true,
+        $"PTP available ({storageCount} storage(s) detected).",
+        null,
+        null,
+        stopwatch.ElapsedMilliseconds
+      );
+    }
+    catch (Exception ex)
+    {
+      stopwatch.Stop();
+      int? nativeErrorCode = TryGetNativeErrorCode(ex, out int parsedCode) ? parsedCode : null;
+      return new PtpStatusResponse(
+        false,
+        "PTP unavailable for this session.",
+        nativeErrorCode,
+        ex.Message,
+        stopwatch.ElapsedMilliseconds
+      );
+    }
+  }
 
 static async Task<int> RunUiAsync(string? udid)
 {
@@ -206,10 +409,17 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
         if (path == "/api/media" && context.Request.HttpMethod == "GET")
         {
             bool includeAdditionalRoots = IsTruthy(context.Request.QueryString["includeAdditionalRoots"]);
-            MediaEnumerationResult media = await MediaIndexStore.GetOrBuildAsync(
-                udid,
-                includeAdditionalRoots,
-                () => EnumerateMediaAssetsHybrid(includeAdditionalRoots, udid)
+          bool forceRefresh = IsTruthy(context.Request.QueryString["forceRefresh"]);
+          MediaEnumerationResult media = forceRefresh
+            ? await MediaIndexStore.ForceRefreshAsync(
+              udid,
+              includeAdditionalRoots,
+              () => EnumerateMediaAssetsHybrid(includeAdditionalRoots, udid)
+            )
+            : await MediaIndexStore.GetOrBuildAsync(
+              udid,
+              includeAdditionalRoots,
+              () => EnumerateMediaAssetsHybrid(includeAdditionalRoots, udid)
             );
             IReadOnlyList<MediaAsset> assets = media.Assets;
 
@@ -288,9 +498,27 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             string remotePath = DecodeAssetId(id);
 
             using AfcSession session = AfcSession.Connect(udid);
-            await StreamRemoteFileToHttpResponseAsync(session.AfcClient, remotePath, context.Response);
+            await StreamRemoteFileToHttpResponseAsync(session.AfcClient, remotePath, context.Request, context.Response, udid);
             return;
         }
+
+          if (path == "/api/thumb" && context.Request.HttpMethod == "GET")
+          {
+            string? id = context.Request.QueryString["id"];
+
+            if (string.IsNullOrWhiteSpace(id))
+            {
+              context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+              await WriteJsonResponseAsync(context.Response, new ErrorResponse("A media id is required."));
+              return;
+            }
+
+            string remotePath = DecodeAssetId(id);
+
+            using AfcSession session = AfcSession.Connect(udid);
+            await StreamThumbnailToHttpResponseAsync(session.AfcClient, remotePath, context.Response, udid);
+            return;
+          }
 
         if (path == "/api/progress" && context.Request.HttpMethod == "GET")
         {
@@ -546,9 +774,23 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                 }
                 selectedAssets.Add(asset);
 
+                DateTimeOffset? captureDateTime = null;
+                if (string.Equals(request.PhotoNaming, "datetime", StringComparison.OrdinalIgnoreCase))
+                {
+                  try
+                  {
+                    captureDateTime = GetRemoteEntryInfo(session.AfcClient, asset.PrimaryRemotePath, udid).CaptureDateTime;
+                  }
+                  catch
+                  {
+                    captureDateTime = null;
+                  }
+                }
+
                 foreach (string remotePath in asset.RemotePaths)
                 {
-                    string localPath = BuildLocalOutputPath(request.DestinationDirectory, remotePath);
+                  string outputName = BuildOutputFileName(remotePath, request.PhotoNaming, captureDateTime);
+                  string localPath = BuildLocalOutputPath(request.DestinationDirectory, remotePath, outputName);
                     filesToCopy.Add(new TransferCopyWorkItem(
                         Guid.NewGuid().ToString("N"),
                         remotePath,
@@ -752,6 +994,12 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             return;
         }
 
+        if (path == "/api/ptp-status" && context.Request.HttpMethod == "GET")
+        {
+          await WriteJsonResponseAsync(context.Response, GetPtpStatus(udid));
+          return;
+        }
+
         if (path == "/api/cache/reset" && context.Request.HttpMethod == "POST")
         {
             MediaIndexStore.PtpFallbackState.Clear(udid);
@@ -780,6 +1028,9 @@ static async Task WriteHtmlResponseAsync(HttpListenerResponse response, string h
     byte[] buffer = Encoding.UTF8.GetBytes(html);
     response.StatusCode = (int)HttpStatusCode.OK;
     response.ContentType = "text/html; charset=utf-8";
+  response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0";
+  response.Headers["Pragma"] = "no-cache";
+  response.Headers["Expires"] = "0";
     response.ContentLength64 = buffer.Length;
     await response.OutputStream.WriteAsync(buffer);
 }
@@ -788,31 +1039,91 @@ static async Task WriteJsonResponseAsync(HttpListenerResponse response, object p
 {
     byte[] buffer = JsonSerializer.SerializeToUtf8Bytes(payload, AppJson.Options);
     response.ContentType = "application/json; charset=utf-8";
+  response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0";
+  response.Headers["Pragma"] = "no-cache";
+  response.Headers["Expires"] = "0";
     response.ContentLength64 = buffer.Length;
     await response.OutputStream.WriteAsync(buffer);
 }
 
-static async Task StreamRemoteFileToHttpResponseAsync(IntPtr afcClient, string remotePath, HttpListenerResponse response)
+static async Task StreamRemoteFileToHttpResponseAsync(
+  IntPtr afcClient,
+  string remotePath,
+  HttpListenerRequest request,
+  HttpListenerResponse response,
+  string? udid = null
+)
 {
+  long? totalSizeBytes = GetRemoteEntryInfo(afcClient, remotePath, udid).SizeBytes;
     ulong afcFileHandle = 0;
     ThrowIfError(
         NativeMethods.afc_file_open(afcClient, remotePath, NativeMethods.AFC_FOPEN_RDONLY, ref afcFileHandle),
         $"Unable to open remote file '{remotePath}'"
     );
 
-    response.StatusCode = (int)HttpStatusCode.OK;
     response.ContentType = GetContentType(remotePath);
-    response.SendChunked = true;
+    response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0";
+    response.Headers["Pragma"] = "no-cache";
+    response.Headers["Expires"] = "0";
+  response.Headers["Accept-Ranges"] = "bytes";
+
+  bool hasValidSize = totalSizeBytes.HasValue && totalSizeBytes.Value >= 0;
+  long startOffset = 0;
+  long endOffset = hasValidSize ? totalSizeBytes!.Value - 1 : -1;
+  bool isRangeResponse = false;
+
+  string? rangeHeader = request.Headers["Range"];
+  if (!string.IsNullOrWhiteSpace(rangeHeader) && hasValidSize)
+  {
+    if (!TryParseSingleByteRange(rangeHeader, totalSizeBytes!.Value, out startOffset, out endOffset))
+    {
+      response.StatusCode = (int)HttpStatusCode.RequestedRangeNotSatisfiable;
+      response.Headers["Content-Range"] = $"bytes */{totalSizeBytes.Value}";
+      return;
+    }
+
+    isRangeResponse = true;
+    response.StatusCode = (int)HttpStatusCode.PartialContent;
+    response.Headers["Content-Range"] = $"bytes {startOffset}-{endOffset}/{totalSizeBytes.Value}";
+    response.ContentLength64 = endOffset - startOffset + 1;
+
+    ThrowIfError(
+      NativeMethods.afc_file_seek(afcClient, afcFileHandle, startOffset, NativeMethods.AFC_SEEK_SET),
+      "Unable to seek remote file for ranged response"
+    );
+  }
+  else
+  {
+    response.StatusCode = (int)HttpStatusCode.OK;
+    if (hasValidSize)
+    {
+      response.ContentLength64 = totalSizeBytes!.Value;
+    }
+    else
+    {
+      response.SendChunked = true;
+    }
+  }
 
     try
     {
         byte[] buffer = new byte[64 * 1024];
+    long remainingBytes = isRangeResponse ? (endOffset - startOffset + 1) : long.MaxValue;
 
         while (true)
         {
             uint bytesRead = 0;
+      uint requestedLength = remainingBytes == long.MaxValue
+        ? (uint)buffer.Length
+        : (uint)Math.Min(buffer.Length, remainingBytes);
+
+      if (requestedLength == 0)
+      {
+        break;
+      }
+
             ThrowIfError(
-                NativeMethods.afc_file_read(afcClient, afcFileHandle, buffer, (uint)buffer.Length, ref bytesRead),
+        NativeMethods.afc_file_read(afcClient, afcFileHandle, buffer, requestedLength, ref bytesRead),
                 "Failed while reading remote file"
             );
 
@@ -822,6 +1133,15 @@ static async Task StreamRemoteFileToHttpResponseAsync(IntPtr afcClient, string r
             }
 
             await response.OutputStream.WriteAsync(buffer.AsMemory(0, (int)bytesRead));
+
+      if (remainingBytes != long.MaxValue)
+      {
+        remainingBytes -= bytesRead;
+        if (remainingBytes <= 0)
+        {
+          break;
+        }
+      }
         }
     }
     finally
@@ -833,10 +1153,209 @@ static async Task StreamRemoteFileToHttpResponseAsync(IntPtr afcClient, string r
     }
 }
 
+  static async Task StreamRemoteFileToHttpResponseSimpleAsync(
+    IntPtr afcClient,
+    string remotePath,
+    HttpListenerResponse response,
+    string? udid = null
+  )
+  {
+    long? totalSizeBytes = GetRemoteEntryInfo(afcClient, remotePath, udid).SizeBytes;
+    ulong afcFileHandle = 0;
+    ThrowIfError(
+      NativeMethods.afc_file_open(afcClient, remotePath, NativeMethods.AFC_FOPEN_RDONLY, ref afcFileHandle),
+      $"Unable to open remote file '{remotePath}'"
+    );
+
+    response.StatusCode = (int)HttpStatusCode.OK;
+    response.ContentType = GetContentType(remotePath);
+    response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0";
+    response.Headers["Pragma"] = "no-cache";
+    response.Headers["Expires"] = "0";
+    if (totalSizeBytes.HasValue && totalSizeBytes.Value >= 0)
+    {
+      response.ContentLength64 = totalSizeBytes.Value;
+    }
+    else
+    {
+      response.SendChunked = true;
+    }
+
+    try
+    {
+      byte[] buffer = new byte[64 * 1024];
+      while (true)
+      {
+        uint bytesRead = 0;
+        ThrowIfError(
+          NativeMethods.afc_file_read(afcClient, afcFileHandle, buffer, (uint)buffer.Length, ref bytesRead),
+          "Failed while reading remote file"
+        );
+
+        if (bytesRead == 0)
+        {
+          break;
+        }
+
+        await response.OutputStream.WriteAsync(buffer.AsMemory(0, (int)bytesRead));
+      }
+    }
+    finally
+    {
+      if (afcFileHandle != 0)
+      {
+        NativeMethods.afc_file_close(afcClient, afcFileHandle);
+      }
+    }
+  }
+
+  static async Task StreamThumbnailToHttpResponseAsync(IntPtr afcClient, string remotePath, HttpListenerResponse response, string? udid = null)
+  {
+    string extension = Path.GetExtension(remotePath).ToLowerInvariant();
+    if (extension is not ".heic" and not ".heif")
+    {
+      await StreamRemoteFileToHttpResponseSimpleAsync(afcClient, remotePath, response, udid);
+      return;
+    }
+
+    try
+    {
+      byte[] sourceBytes = ReadRemoteFileBytes(afcClient, remotePath);
+      using MagickImage image = new(sourceBytes);
+      image.AutoOrient();
+      image.Resize(new MagickGeometry(640, 640));
+      image.Strip();
+      image.Format = MagickFormat.Jpeg;
+      image.Quality = 80;
+      byte[] thumbBytes = image.ToByteArray();
+
+      response.StatusCode = (int)HttpStatusCode.OK;
+      response.ContentType = "image/jpeg";
+      response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0";
+      response.Headers["Pragma"] = "no-cache";
+      response.Headers["Expires"] = "0";
+      response.ContentLength64 = thumbBytes.Length;
+      await response.OutputStream.WriteAsync(thumbBytes);
+    }
+    catch
+    {
+      await StreamRemoteFileToHttpResponseSimpleAsync(afcClient, remotePath, response, udid);
+    }
+  }
+
+  static byte[] ReadRemoteFileBytes(IntPtr afcClient, string remotePath)
+  {
+    ulong afcFileHandle = 0;
+    ThrowIfError(
+      NativeMethods.afc_file_open(afcClient, remotePath, NativeMethods.AFC_FOPEN_RDONLY, ref afcFileHandle),
+      $"Unable to open remote file '{remotePath}'"
+    );
+
+    try
+    {
+      using MemoryStream memory = new();
+      byte[] buffer = new byte[64 * 1024];
+
+      while (true)
+      {
+        uint bytesRead = 0;
+        ThrowIfError(
+          NativeMethods.afc_file_read(afcClient, afcFileHandle, buffer, (uint)buffer.Length, ref bytesRead),
+          "Failed while reading remote file"
+        );
+
+        if (bytesRead == 0)
+        {
+          break;
+        }
+
+        memory.Write(buffer, 0, (int)bytesRead);
+      }
+
+      return memory.ToArray();
+    }
+    finally
+    {
+      if (afcFileHandle != 0)
+      {
+        NativeMethods.afc_file_close(afcClient, afcFileHandle);
+      }
+    }
+  }
+
+  static bool TryParseSingleByteRange(string rangeHeader, long totalLength, out long start, out long end)
+  {
+    start = 0;
+    end = 0;
+
+    if (totalLength <= 0)
+    {
+      return false;
+    }
+
+    if (!rangeHeader.StartsWith("bytes=", StringComparison.OrdinalIgnoreCase))
+    {
+      return false;
+    }
+
+    string value = rangeHeader["bytes=".Length..].Trim();
+    if (string.IsNullOrWhiteSpace(value) || value.Contains(','))
+    {
+      // Multi-range responses are not supported here.
+      return false;
+    }
+
+    int dashIndex = value.IndexOf('-');
+    if (dashIndex < 0)
+    {
+      return false;
+    }
+
+    string startText = value[..dashIndex].Trim();
+    string endText = value[(dashIndex + 1)..].Trim();
+
+    if (startText.Length == 0)
+    {
+      // Suffix range: bytes=-N
+      if (!long.TryParse(endText, out long suffixLength) || suffixLength <= 0)
+      {
+        return false;
+      }
+
+      start = Math.Max(0, totalLength - suffixLength);
+      end = totalLength - 1;
+      return start <= end;
+    }
+
+    if (!long.TryParse(startText, out start) || start < 0 || start >= totalLength)
+    {
+      return false;
+    }
+
+    if (endText.Length == 0)
+    {
+      end = totalLength - 1;
+      return true;
+    }
+
+    if (!long.TryParse(endText, out end) || end < start)
+    {
+      return false;
+    }
+
+    if (end >= totalLength)
+    {
+      end = totalLength - 1;
+    }
+
+    return start <= end;
+  }
+
 static void WriteUsage()
 {
     Console.WriteLine("Usage:");
     Console.WriteLine("  AppleFileConduitDemo [ui|--ui] [deviceUdid]");
+  Console.WriteLine("  AppleFileConduitDemo [ptp-test|--ptp-test] [--continuous] [--interval <seconds>] [deviceUdid|--udid=<deviceUdid>]");
     Console.WriteLine("  AppleFileConduitDemo [list|--list] <remoteDirectoryPath> [deviceUdid]");
     Console.WriteLine("  AppleFileConduitDemo [copy|--copy] <remoteFilePath> <localOutputPath> [deviceUdid]");
     Console.WriteLine("  AppleFileConduitDemo [move|--move] <remoteFilePath> <localOutputPath> [deviceUdid]");
@@ -1411,10 +1930,17 @@ static RemoteEntryInfo GetRemoteEntryInfoRaw(IntPtr afcClient, string normalized
             size = parsedSize;
         }
 
+        DateTimeOffset? captureDateTime =
+          TryReadAfcTimestamp(values, "st_birthtime")
+          ?? TryReadAfcTimestamp(values, "st_mtime")
+          ?? TryReadAfcTimestamp(values, "st_mtimespec")
+          ?? TryReadAfcTimestamp(values, "st_ctime");
+
         return new RemoteEntryInfo(
             string.Equals(fileType, "S_IFDIR", StringComparison.Ordinal),
             string.Equals(fileType, "S_IFREG", StringComparison.Ordinal),
-            size
+          size,
+          captureDateTime
         );
     }
     finally
@@ -1458,6 +1984,38 @@ static Dictionary<string, string> ReadDictionary(IntPtr dictionary)
     }
 
     return values;
+}
+
+static DateTimeOffset? TryReadAfcTimestamp(IReadOnlyDictionary<string, string> values, string key)
+{
+  if (!values.TryGetValue(key, out string? rawValue) || string.IsNullOrWhiteSpace(rawValue))
+  {
+    return null;
+  }
+
+  if (!long.TryParse(rawValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out long timestamp))
+  {
+    return null;
+  }
+
+  try
+  {
+    if (timestamp > 10_000_000_000L)
+    {
+      return DateTimeOffset.FromUnixTimeMilliseconds(timestamp);
+    }
+
+    if (timestamp > 0)
+    {
+      return DateTimeOffset.FromUnixTimeSeconds(timestamp);
+    }
+  }
+  catch
+  {
+    return null;
+  }
+
+  return null;
 }
 
 static string NormalizeRemotePath(string remotePath)
@@ -1616,14 +2174,38 @@ static void DeleteRemotePathRecursive(IntPtr afcClient, string remotePath, strin
     ThrowIfError(NativeMethods.afc_remove_path(afcClient, normalizedPath), $"Unable to delete remote directory '{normalizedPath}'");
 }
 
-static string BuildLocalOutputPath(string destinationDirectory, string remotePath)
+static string BuildLocalOutputPath(string destinationDirectory, string remotePath, string? overrideFileName = null)
 {
     string relativePath = remotePath.StartsWith("DCIM/", StringComparison.OrdinalIgnoreCase)
         ? remotePath["DCIM/".Length..]
         : remotePath.TrimStart('/');
 
     string[] segments = relativePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+  if (!string.IsNullOrWhiteSpace(overrideFileName) && segments.Length > 0)
+  {
+    segments[^1] = overrideFileName;
+  }
+
     return Path.Combine(destinationDirectory, Path.Combine(segments));
+}
+
+static string BuildOutputFileName(string remotePath, string? photoNaming, DateTimeOffset? captureDateTime)
+{
+  string originalFileName = Path.GetFileName(remotePath);
+  if (string.IsNullOrWhiteSpace(originalFileName))
+  {
+    return remotePath;
+  }
+
+  if (!string.Equals(photoNaming, "datetime", StringComparison.OrdinalIgnoreCase) || captureDateTime is null)
+  {
+    return originalFileName;
+  }
+
+  string baseName = Path.GetFileNameWithoutExtension(originalFileName);
+  string extension = Path.GetExtension(originalFileName);
+  string timestamp = captureDateTime.Value.ToLocalTime().ToString("yyyy_MM_dd_HH_mm_ss", CultureInfo.InvariantCulture);
+  return $"{timestamp}_{baseName}{extension}";
 }
 
 static byte[] CopyRemoteFileToLocalAndComputeHash(IntPtr afcClient, string remotePath, string localPath, Action<long, long?>? onProgress = null)
@@ -1859,6 +2441,8 @@ internal struct LockdownServiceDescriptorRaw
 
 internal sealed class PtpSession : IDisposable
 {
+  private static readonly string[] PtpServiceIdentifiers = ["com.apple.ptp", "com.apple.mobile.ptp"];
+
     private const ushort PtpContainerTypeCommand = 1;
     private const ushort PtpContainerTypeData = 2;
     private const ushort PtpContainerTypeResponse = 3;
@@ -1901,13 +2485,37 @@ internal sealed class PtpSession : IDisposable
                 NativeMethods.lockdownd_client_new_with_handshake(device, ref lockdowndClient, "AppleFileConduitDemo"),
                 "Unable to start lockdownd session"
             );
-            NativeError.ThrowIfError(
-                NativeMethods.lockdownd_start_service(lockdowndClient, "com.apple.ptp", ref serviceDescriptor),
-                "Unable to start PTP service"
-            );
+
+            int lastServiceError = 0;
+            foreach (string serviceName in PtpServiceIdentifiers)
+            {
+                serviceDescriptor = IntPtr.Zero;
+                int startError = NativeMethods.lockdownd_start_service(lockdowndClient, serviceName, ref serviceDescriptor);
+                if (startError != 0)
+                {
+                    // Some iOS builds only allow service startup with an escrow bag.
+                    serviceDescriptor = IntPtr.Zero;
+                    startError = NativeMethods.lockdownd_start_service_with_escrow_bag(lockdowndClient, serviceName, ref serviceDescriptor);
+                }
+
+                if (startError == 0 && serviceDescriptor != IntPtr.Zero)
+                {
+                    break;
+                }
+
+                lastServiceError = startError;
+                if (serviceDescriptor != IntPtr.Zero)
+                {
+                    NativeMethods.lockdownd_service_descriptor_free(serviceDescriptor);
+                    serviceDescriptor = IntPtr.Zero;
+                }
+            }
+
             if (serviceDescriptor == IntPtr.Zero)
             {
-                throw new InvalidOperationException("PTP service descriptor was empty.");
+                throw new InvalidOperationException(
+                    $"Unable to start PTP service. Tried: {string.Join(", ", PtpServiceIdentifiers)}. Native error code: {lastServiceError}"
+                );
             }
 
             LockdownServiceDescriptorRaw descriptor = Marshal.PtrToStructure<LockdownServiceDescriptorRaw>(serviceDescriptor);
@@ -2353,7 +2961,7 @@ internal sealed class AfcSession : IDisposable
 
 internal sealed record RemoteFileEntry(string Path);
 
-internal sealed record RemoteEntryInfo(bool IsDirectory, bool IsFile, long? SizeBytes);
+internal sealed record RemoteEntryInfo(bool IsDirectory, bool IsFile, long? SizeBytes, DateTimeOffset? CaptureDateTime);
 
 internal sealed record MediaAsset(
     string Id,
@@ -2391,9 +2999,14 @@ internal sealed record MediaAssetView(
     public static MediaAssetView FromAsset(MediaAsset asset)
     {
         string extension = Path.GetExtension(asset.PrimaryRemotePath).ToLowerInvariant();
+      string previewUrl = extension is ".heic" or ".heif"
+        ? $"/api/thumb?id={Uri.EscapeDataString(asset.Id)}"
+        : $"/api/file?id={Uri.EscapeDataString(asset.Id)}";
         string previewMode = asset.Kind == MediaKind.Video
             ? "video"
-            : extension is ".jpg" or ".jpeg" or ".png" or ".gif" or ".bmp" or ".webp" ? "image" : "placeholder";
+        : extension is ".jpg" or ".jpeg" or ".png" or ".gif" or ".bmp" or ".webp" or ".heic" or ".heif" or ".dng" or ".tif" or ".tiff"
+          ? "image"
+          : "placeholder";
         return new MediaAssetView(
             asset.Id,
             asset.Name,
@@ -2404,7 +3017,7 @@ internal sealed record MediaAssetView(
                 _ => "photo"
             },
             asset.PrimaryRemotePath,
-            $"/api/file?id={Uri.EscapeDataString(asset.Id)}",
+            previewUrl,
             previewMode,
             asset.PrimaryRemotePath.StartsWith("DCIM/", StringComparison.OrdinalIgnoreCase)
                 ? asset.PrimaryRemotePath["DCIM/".Length..]
@@ -2415,7 +3028,7 @@ internal sealed record MediaAssetView(
 
 internal sealed record MediaLibraryResponse(MediaAssetView[] Items, int PhotoCount, int LivePhotoCount, int VideoCount, string[] ScannedRoots, string Backend, string? BackendNote);
 
-internal sealed record TransferRequest(string[] AssetIds, string DestinationDirectory, string Operation, bool IncludeAdditionalRoots, int Parallelism = 4, string? OperationId = null);
+internal sealed record TransferRequest(string[] AssetIds, string DestinationDirectory, string Operation, bool IncludeAdditionalRoots, int Parallelism = 4, string? OperationId = null, string PhotoNaming = "datetime");
 
 internal sealed record TransferResponse(string Message, string[] LocalPaths, FailedTransferItem[] FailedItems);
 
@@ -2426,6 +3039,8 @@ internal sealed record RemoteFsEntry(string Name, string Path, bool IsDirectory,
 internal sealed record RemoteFsListingResponse(string CurrentPath, string? ParentPath, RemoteFsEntry[] Entries);
 
 internal sealed record ErrorResponse(string Message);
+
+internal sealed record PtpStatusResponse(bool IsAvailable, string Message, int? NativeErrorCode, string? Detail, long ProbeDurationMs);
 
 internal sealed record FailedTransferItem(string RemoteFilePath, string? LocalPath, string ErrorMessage);
 
@@ -2803,6 +3418,26 @@ internal static class MediaIndexStore
         }
     }
 
+      public static async Task<MediaEnumerationResult> ForceRefreshAsync(string? udid, bool includeAdditionalRoots, Func<MediaEnumerationResult> refreshFactory)
+      {
+        string key = BuildKey(udid, includeAdditionalRoots);
+        SemaphoreSlim refreshLock = RefreshLocks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+        await refreshLock.WaitAsync();
+        try
+        {
+          return await Task.Run(() =>
+          {
+            MediaEnumerationResult refreshed = refreshFactory();
+            Snapshots[key] = new CacheEntry<MediaEnumerationResult>(refreshed);
+            return refreshed;
+          });
+        }
+        finally
+        {
+          refreshLock.Release();
+        }
+      }
+
     public static void MarkDirty(string? udid)
     {
         string prefix = $"{GetDeviceKey(udid)}|";
@@ -3028,6 +3663,45 @@ internal static class UiPage
       color: #2246b7;
       transition: transform .15s ease, background .15s ease;
     }
+    .scan-dropdown {
+      position: relative;
+      display: inline-flex;
+      align-items: stretch;
+      min-width: 0;
+    }
+    .scan-dropdown .scan-main {
+      border-top-right-radius: 0;
+      border-bottom-right-radius: 0;
+      white-space: nowrap;
+    }
+    .scan-dropdown .scan-toggle {
+      border-top-left-radius: 0;
+      border-bottom-left-radius: 0;
+      border-left: 1px solid rgba(34, 70, 183, 0.2);
+      min-width: 38px;
+      padding: 12px 10px;
+    }
+    .scan-menu {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      min-width: 220px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: var(--shadow);
+      padding: 8px;
+      display: grid;
+      gap: 6px;
+      z-index: 30;
+    }
+    .scan-menu button {
+      width: 100%;
+      text-align: left;
+      border-radius: 9px;
+      padding: 10px 12px;
+      white-space: nowrap;
+    }
     button:hover { transform: translateY(-1px); }
     button.primary {
       background: var(--accent);
@@ -3082,6 +3756,14 @@ internal static class UiPage
       font-size: .98rem;
     }
     .status.error { color: #b63838; }
+    .ptp-status {
+      min-height: 20px;
+      margin: -10px 0 14px;
+      color: var(--muted);
+      font-size: .88rem;
+    }
+    .ptp-status.ok { color: #2b7a3e; }
+    .ptp-status.error { color: #b63838; }
     .transfer-progress-panel {
       background: var(--panel);
       border: 1px solid var(--border);
@@ -3187,6 +3869,54 @@ internal static class UiPage
       display: block;
       background: linear-gradient(135deg, #d9e3ff, #edf2ff);
     }
+    .thumb-shell {
+      position: relative;
+      aspect-ratio: 1 / 1;
+      overflow: hidden;
+      background: linear-gradient(135deg, #d9e3ff, #edf2ff);
+    }
+    .thumb-shell .preview {
+      width: 100%;
+      height: 100%;
+      aspect-ratio: auto;
+    }
+    .thumb-shell .thumb-loading {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(135deg, rgba(126, 140, 184, 0.24), rgba(28, 34, 56, 0.24));
+      z-index: 1;
+    }
+    .thumb-shell.loaded .thumb-loading,
+    .thumb-shell.error .thumb-loading {
+      display: none;
+    }
+    .card-copy-progress {
+      height: 4px;
+      overflow: hidden;
+      background: rgba(58, 208, 72, 0.26);
+    }
+    .card-copy-progress-fill {
+      height: 100%;
+      width: 0%;
+      background: #32dd46;
+      transition: width .2s ease;
+    }
+    .card-copy-progress-fill.indeterminate {
+      width: 42%;
+      animation: thumbProgress 0.9s linear infinite;
+    }
+    .card-copy-progress.failed {
+      background: rgba(192,56,56,0.22);
+    }
+    .card-copy-progress.failed .card-copy-progress-fill {
+      background: #c03838;
+    }
+    @keyframes thumbProgress {
+      0% { transform: translateX(-120%); }
+      100% { transform: translateX(320%); }
+    }
     .video-preview {
       position: relative;
       aspect-ratio: 1 / 1;
@@ -3201,6 +3931,29 @@ internal static class UiPage
       object-fit: cover;
       display: block;
       background: transparent;
+    }
+    .video-loading {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(135deg, rgba(126, 140, 184, 0.24), rgba(28, 34, 56, 0.34));
+      z-index: 1;
+    }
+    .video-loading.hidden {
+      display: none;
+    }
+    .video-spinner {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      border: 3px solid rgba(255, 255, 255, 0.35);
+      border-top-color: #ffffff;
+      animation: videoSpin 0.8s linear infinite;
+    }
+    @keyframes videoSpin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
     }
     .fallback-icon {
       font-size: 3rem;
@@ -3479,6 +4232,52 @@ internal static class UiPage
       margin-left: 4px;
     }
     .modal-footer { display: flex; gap: 10px; justify-content: flex-end; padding: 14px 24px; border-top: 1px solid var(--border); flex-shrink: 0; }
+    .preview-modal {
+      max-width: 980px;
+      width: 95%;
+      max-height: 90vh;
+    }
+    .preview-body {
+      padding: 14px;
+      background: rgba(14, 18, 28, 0.94);
+      display: grid;
+      place-items: center;
+      min-height: 280px;
+    }
+    .preview-body img,
+    .preview-body video {
+      max-width: 100%;
+      max-height: 72vh;
+      border-radius: 12px;
+      box-shadow: 0 10px 32px rgba(0,0,0,0.35);
+      background: #111626;
+    }
+    .context-menu {
+      position: fixed;
+      z-index: 350;
+      min-width: 190px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      box-shadow: var(--shadow);
+      padding: 6px;
+      display: grid;
+      gap: 4px;
+    }
+    .context-menu button {
+      width: 100%;
+      text-align: left;
+      padding: 9px 10px;
+      border-radius: 8px;
+      border: 0;
+      background: transparent;
+      color: var(--text);
+      cursor: pointer;
+    }
+    .context-menu button:hover {
+      background: var(--border);
+      transform: none;
+    }
     .setting-row {
       display: grid;
       gap: 6px;
@@ -3566,8 +4365,14 @@ internal static class UiPage
         <input type="checkbox" id="includeAdditionalRoots" title="Any iCloud-downloaded originals that live in /var/mobile/Media/PhotoData/">
         <span>Include PhotoData</span>
       </label>
-      <button id="scanButton">Scan Media</button>
-      <button id="resetCacheButton" title="Clear cached media and file-system metadata for this device">Reset Cache</button>
+      <div class="scan-dropdown" id="scanDropdown">
+        <button id="scanButton" class="scan-main">Scan</button>
+        <button id="scanMenuButton" class="scan-toggle" title="More scan actions" aria-label="More scan actions">▾</button>
+        <div class="scan-menu hidden" id="scanMenu">
+          <button id="scanCachedButton">Scan</button>
+          <button id="scanRecacheButton" title="Scan and recache resets media and file-system cache before scanning.">Scan and recache</button>
+        </div>
+      </div>
       <button class="hidden" id="retryPtpButton" title="Clear the PTP retry cooldown and scan again using PTP">Retry PTP</button>
       <button class="primary" id="copyButton">Copy Selected</button>
       <button class="danger" id="moveButton">Move Selected</button>
@@ -3578,7 +4383,8 @@ internal static class UiPage
     </div>
 
     <div class="progress-bar" id="progressBar"></div>
-    <div class="status" id="status">Choose options and click Scan Media to start.</div>
+    <div class="status" id="status">Choose options and click Scan to start.</div>
+    <div class="ptp-status" id="ptpStatus">PTP status: checking...</div>
     <div class="transfer-progress-panel hidden" id="transferProgressPanel">
       <div class="transfer-progress-summary" id="transferProgressSummary"></div>
       <div class="transfer-progress-list" id="transferProgressList"></div>
@@ -3632,6 +4438,14 @@ internal static class UiPage
               <div class="setting-hint">Number of files to copy, move, or delete simultaneously (1–16).</div>
               <input type="range" id="parallelismInput" min="1" max="16" value="4" aria-label="Parallel transfers">
             </div>
+            <div class="settings-section" style="margin-top:14px;">
+              <p class="settings-section-title">Media Refresh</p>
+              <p class="settings-section-hint">When enabled, copy operations in Media view automatically rescan items after completion. Move operations always rescan.</p>
+              <label class="settings-check-row">
+                <input type="checkbox" id="settingAutoRefreshAfterTransfer">
+                Auto-refresh after copy
+              </label>
+            </div>
           </div>
 
           <!-- Photos panel -->
@@ -3661,6 +4475,7 @@ internal static class UiPage
                 <input type="radio" name="photoNaming" id="settingNamingDatetime" value="datetime" checked>
                 Name by Capture Date/Time
               </label>
+              <p class="settings-section-hint">Capture Date/Time format: yyyy_MM_dd_HH_mm_ss_originalName (example: 2023_04_11_21_59_57_IMG_2814).</p>
             </div>
 
             <div class="settings-section">
@@ -3708,6 +4523,20 @@ internal static class UiPage
     </div>
   </div>
 
+  <div class="modal-overlay" id="previewOverlay" role="dialog" aria-modal="true" aria-labelledby="previewTitle">
+    <div class="modal preview-modal">
+      <h2 class="modal-title" id="previewTitle">Preview</h2>
+      <div class="preview-body" id="previewBody"></div>
+      <div class="modal-footer">
+        <button class="primary" id="previewCloseButton">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="context-menu hidden" id="cardContextMenu">
+    <button id="contextPreviewButton">Preview</button>
+  </div>
+
   <script>
     const settingsStorageKey = 'afc-settings';
 
@@ -3721,6 +4550,7 @@ internal static class UiPage
 
     const settings = Object.assign({
       parallelism: 4,
+      autoRefreshAfterTransfer: false,
       exportOriginalPhoto: true,
       exportEditedVersion: true,
       photoNaming: 'datetime',
@@ -3742,12 +4572,18 @@ internal static class UiPage
       transferProgressSnapshot: null,
       transferProgressOperationId: null,
       transferProgressTimer: null,
-      ptpFallbackActive: false
+      ptpFallbackActive: false,
+      videoPreviewCache: new Map(),
+      videoHydrating: new Set(),
+      videoHydrationQueue: [],
+      videoHydrationActive: 0,
+      contextMenuItem: null
     };
 
     const summary = document.getElementById('summary');
     const fsSummary = document.getElementById('fsSummary');
     const status = document.getElementById('status');
+    const ptpStatus = document.getElementById('ptpStatus');
     const progressBar = document.getElementById('progressBar');
     const grid = document.getElementById('grid');
     const fsList = document.getElementById('fsList');
@@ -3757,8 +4593,12 @@ internal static class UiPage
     const viewModeInput = document.getElementById('viewMode');
     const filterInput = document.getElementById('filter');
     const includeAdditionalRootsInput = document.getElementById('includeAdditionalRoots');
+    const scanDropdown = document.getElementById('scanDropdown');
     const scanButton = document.getElementById('scanButton');
-    const resetCacheButton = document.getElementById('resetCacheButton');
+    const scanMenuButton = document.getElementById('scanMenuButton');
+    const scanMenu = document.getElementById('scanMenu');
+    const scanCachedButton = document.getElementById('scanCachedButton');
+    const scanRecacheButton = document.getElementById('scanRecacheButton');
     const retryPtpButton = document.getElementById('retryPtpButton');
     const copyButton = document.getElementById('copyButton');
     const moveButton = document.getElementById('moveButton');
@@ -3772,8 +4612,15 @@ internal static class UiPage
     const settingsButton = document.getElementById('settingsButton');
     const settingsOverlay = document.getElementById('settingsOverlay');
     const settingsCloseButton = document.getElementById('settingsCloseButton');
+    const previewOverlay = document.getElementById('previewOverlay');
+    const previewBody = document.getElementById('previewBody');
+    const previewTitle = document.getElementById('previewTitle');
+    const previewCloseButton = document.getElementById('previewCloseButton');
+    const cardContextMenu = document.getElementById('cardContextMenu');
+    const contextPreviewButton = document.getElementById('contextPreviewButton');
     const parallelismInput = document.getElementById('parallelismInput');
     const parallelismValue = document.getElementById('parallelismValue');
+    const settingAutoRefreshAfterTransfer = document.getElementById('settingAutoRefreshAfterTransfer');
     const settingExportOriginal = document.getElementById('settingExportOriginal');
     const settingExportEdited = document.getElementById('settingExportEdited');
     const settingNamingOriginal = document.getElementById('settingNamingOriginal');
@@ -3792,6 +4639,7 @@ internal static class UiPage
     const transferProgressPanel = document.getElementById('transferProgressPanel');
     const transferProgressSummary = document.getElementById('transferProgressSummary');
     const transferProgressList = document.getElementById('transferProgressList');
+    let ptpStatusTimer = null;
 
     filterInput.addEventListener('change', () => {
       state.filter = filterInput.value;
@@ -3800,8 +4648,19 @@ internal static class UiPage
     });
 
     viewModeInput.addEventListener('change', () => setViewMode(viewModeInput.value));
-    scanButton.addEventListener('click', () => loadMedia());
-    resetCacheButton.addEventListener('click', () => resetCache());
+    scanButton.addEventListener('click', () => loadMedia(false));
+    scanMenuButton.addEventListener('click', event => {
+      event.stopPropagation();
+      scanMenu.classList.toggle('hidden');
+    });
+    scanCachedButton.addEventListener('click', () => {
+      closeScanMenu();
+      loadMedia(false);
+    });
+    scanRecacheButton.addEventListener('click', () => {
+      closeScanMenu();
+      scanAndRecache();
+    });
     retryPtpButton.addEventListener('click', () => retryPtp());
     copyButton.addEventListener('click', () => transfer('copy'));
     moveButton.addEventListener('click', () => transfer('move'));
@@ -3820,13 +4679,38 @@ internal static class UiPage
     settingsOverlay.addEventListener('click', event => {
       if (event.target === settingsOverlay) closeSettings();
     });
+    previewOverlay.addEventListener('click', event => {
+      if (event.target === previewOverlay) closePreview();
+    });
     settingsCloseButton.addEventListener('click', () => closeSettings());
+    previewCloseButton.addEventListener('click', () => closePreview());
+    contextPreviewButton.addEventListener('click', () => {
+      if (state.contextMenuItem) {
+        openPreview(state.contextMenuItem);
+      }
+      closeContextMenu();
+    });
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape' && settingsOverlay.classList.contains('active')) closeSettings();
+      if (event.key === 'Escape' && previewOverlay.classList.contains('active')) closePreview();
+      if (event.key === 'Escape') closeScanMenu();
+      if (event.key === 'Escape') closeContextMenu();
+    });
+    document.addEventListener('click', event => {
+      if (!scanDropdown.contains(event.target)) {
+        closeScanMenu();
+      }
+      if (!cardContextMenu.contains(event.target)) {
+        closeContextMenu();
+      }
     });
     parallelismInput.addEventListener('input', () => {
       settings.parallelism = parseInt(parallelismInput.value);
       parallelismValue.textContent = settings.parallelism;
+      saveSettings();
+    });
+    settingAutoRefreshAfterTransfer.addEventListener('change', () => {
+      settings.autoRefreshAfterTransfer = settingAutoRefreshAfterTransfer.checked;
       saveSettings();
     });
     settingExportOriginal.addEventListener('change', () => { settings.exportOriginalPhoto = settingExportOriginal.checked; saveSettings(); });
@@ -3851,7 +4735,9 @@ internal static class UiPage
       copyButton.disabled = value;
       moveButton.disabled = value;
       scanButton.disabled = value;
-      resetCacheButton.disabled = value;
+      scanMenuButton.disabled = value;
+      scanCachedButton.disabled = value;
+      scanRecacheButton.disabled = value;
       retryPtpButton.disabled = value;
       fsCopyButton.disabled = value;
       fsMoveButton.disabled = value;
@@ -3866,9 +4752,41 @@ internal static class UiPage
       progressBar.classList.toggle('active', value);
     }
 
+    function closeScanMenu() {
+      scanMenu.classList.add('hidden');
+    }
+
     function setStatus(message, isError = false) {
       status.textContent = message;
       status.classList.toggle('error', isError);
+    }
+
+    function setPtpStatus(message, isAvailable) {
+      ptpStatus.textContent = message;
+      ptpStatus.classList.toggle('ok', isAvailable === true);
+      ptpStatus.classList.toggle('error', isAvailable === false);
+    }
+
+    async function refreshPtpStatus() {
+      try {
+        const response = await fetch(`/api/ptp-status?_=${Date.now()}`, { cache: 'no-store' });
+        if (!response.ok) {
+          throw new Error('PTP status endpoint unavailable.');
+        }
+
+        const data = await response.json();
+        const codeNote = data.nativeErrorCode != null ? ` (error ${data.nativeErrorCode})` : '';
+        const detailNote = !data.isAvailable && data.detail ? ` ${data.detail}` : '';
+        const timingNote = data.probeDurationMs != null ? ` [${data.probeDurationMs} ms]` : '';
+        setPtpStatus(
+          data.isAvailable
+            ? `PTP status: Available${timingNote}`
+            : `PTP status: Unavailable${codeNote}${timingNote}.${detailNote}`,
+          Boolean(data.isAvailable)
+        );
+      } catch {
+        setPtpStatus('PTP status: unavailable (status probe failed).', false);
+      }
     }
 
     function createOperationId() {
@@ -3909,6 +4827,18 @@ internal static class UiPage
       );
     }
 
+    function getMediaProgressByPath() {
+      if (isFsTransferProgress() || !state.transferProgressSnapshot?.items?.length) {
+        return new Map();
+      }
+
+      return new Map(
+        state.transferProgressSnapshot.items
+          .filter(item => item?.remotePath)
+          .map(item => [item.remotePath, item])
+      );
+    }
+
     function progressPercentForItem(item) {
       if (item.status === 'succeeded') return 100;
       if (item.status === 'failed') return item.totalBytes > 0 ? Math.min(100, (item.bytesCopied / item.totalBytes) * 100) : 100;
@@ -3927,6 +4857,8 @@ internal static class UiPage
         transferProgressSummary.textContent = '';
         if (previousWasFsProgress) {
           renderFsList();
+        } else {
+          renderGrid();
         }
         return;
       }
@@ -3936,6 +4868,9 @@ internal static class UiPage
         transferProgressList.innerHTML = '';
         transferProgressSummary.textContent = '';
         renderFsList();
+        if (!previousWasFsProgress) {
+          renderGrid();
+        }
         return;
       }
 
@@ -3973,6 +4908,8 @@ internal static class UiPage
       if (previousWasFsProgress) {
         renderFsList();
       }
+
+      renderGrid();
     }
 
     async function fetchTransferProgress(operationId) {
@@ -4008,6 +4945,7 @@ internal static class UiPage
     function openSettings() {
       parallelismInput.value = settings.parallelism;
       parallelismValue.textContent = settings.parallelism;
+      settingAutoRefreshAfterTransfer.checked = Boolean(settings.autoRefreshAfterTransfer);
       settingExportOriginal.checked = settings.exportOriginalPhoto;
       settingExportEdited.checked = settings.exportEditedVersion;
       settingNamingOriginal.checked = settings.photoNaming === 'original';
@@ -4024,6 +4962,57 @@ internal static class UiPage
 
     function closeSettings() {
       settingsOverlay.classList.remove('active');
+    }
+
+    function openPreview(item) {
+      if (!item) return;
+      previewTitle.textContent = `Preview: ${item.name}`;
+      previewBody.innerHTML = '';
+
+      if (item.previewMode === 'video') {
+        const video = document.createElement('video');
+        video.controls = true;
+        video.autoplay = true;
+        video.preload = 'metadata';
+        video.playsInline = true;
+        video.src = item.previewUrl;
+        previewBody.appendChild(video);
+      } else if (item.previewMode === 'image') {
+        const image = document.createElement('img');
+        image.loading = 'eager';
+        image.alt = item.name;
+        image.src = item.previewUrl;
+        image.addEventListener('error', () => {
+          previewBody.innerHTML = '<div class="empty">Unable to preview this item.</div>';
+        });
+        previewBody.appendChild(image);
+      } else {
+        previewBody.innerHTML = '<div class="empty">Preview is not available for this file type.</div>';
+      }
+
+      previewOverlay.classList.add('active');
+      previewCloseButton.focus();
+    }
+
+    function closePreview() {
+      previewOverlay.classList.remove('active');
+      previewBody.innerHTML = '';
+    }
+
+    function openCardContextMenu(item, x, y) {
+      state.contextMenuItem = item;
+      cardContextMenu.classList.remove('hidden');
+      const menuWidth = 200;
+      const menuHeight = 52;
+      const left = Math.min(x, window.innerWidth - menuWidth - 8);
+      const top = Math.min(y, window.innerHeight - menuHeight - 8);
+      cardContextMenu.style.left = `${Math.max(8, left)}px`;
+      cardContextMenu.style.top = `${Math.max(8, top)}px`;
+    }
+
+    function closeContextMenu() {
+      state.contextMenuItem = null;
+      cardContextMenu.classList.add('hidden');
     }
 
     async function loadQueue() {
@@ -4124,7 +5113,7 @@ internal static class UiPage
       mediaView.classList.toggle('hidden', fsMode);
       fsView.classList.toggle('hidden', !fsMode);
       filterInput.classList.toggle('hidden', fsMode);
-      scanButton.classList.toggle('hidden', fsMode);
+      scanDropdown.classList.toggle('hidden', fsMode);
       retryPtpButton.classList.toggle('hidden', fsMode || !state.ptpFallbackActive);
       copyButton.classList.toggle('hidden', fsMode);
       moveButton.classList.toggle('hidden', fsMode);
@@ -4141,7 +5130,7 @@ internal static class UiPage
 
       setStatus(fsMode
         ? 'File system view: open a folder and select files or folders to copy, move, or delete.'
-        : 'Media view: choose options and click Scan Media to start.');
+        : 'Media view: choose options and click Scan to start.');
     }
 
     function filteredItems() {
@@ -4188,9 +5177,10 @@ internal static class UiPage
 
     function renderGrid() {
       const visible = filteredItems();
+      const mediaProgressByPath = getMediaProgressByPath();
 
       if (visible.length === 0) {
-        grid.innerHTML = '<div class="empty">No matching media was found. Click Scan Media to load items.</div>';
+        grid.innerHTML = '<div class="empty">No matching media was found. Click Scan to load items.</div>';
         return;
       }
 
@@ -4202,6 +5192,14 @@ internal static class UiPage
         card.className = `card${selected ? ' selected' : ''}`;
         card.tabIndex = 0;
         card.addEventListener('click', () => toggleSelection(item.id));
+        card.addEventListener('contextmenu', event => {
+          event.preventDefault();
+          openCardContextMenu(item, event.clientX, event.clientY);
+        });
+        card.addEventListener('dblclick', event => {
+          event.preventDefault();
+          openPreview(item);
+        });
         card.addEventListener('keydown', event => {
           if (event.key === 'Enter' || event.key === ' ') {
             event.preventDefault();
@@ -4211,13 +5209,18 @@ internal static class UiPage
 
         const livePhotoIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20"><circle cx="12" cy="12" r="2.5" fill="white"/><circle cx="12" cy="12" r="7" fill="none" stroke="white" stroke-width="1.5"/><circle cx="12" cy="12" r="11" fill="none" stroke="white" stroke-width="1.5"/></svg>`;
         const timerIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round"><circle cx="7" cy="7" r="6"/><polyline points="7 3.5 7 7 9.5 8.5"/></svg>`;
+        const cachedVideo = item.previewMode === 'video' ? state.videoPreviewCache.get(item.id) : null;
+        const progressItem = mediaProgressByPath.get(item.primaryRemotePath);
         const badgeMarkup = item.kind === 'live-photo' ? `<div class="badge">${livePhotoIcon}</div>` : '';
-        const durationMarkup = item.kind === 'video' ? `<div class="duration">${timerIcon}<span class="dur-text">0:00</span></div>` : '';
+        const durationMarkup = item.kind === 'video' ? `<div class="duration">${timerIcon}<span class="dur-text">${cachedVideo?.durationText || '--:--'}</span></div>` : '';
+        const progressMarkup = buildMediaCopyProgressMarkup(progressItem);
         const selectorText = selected ? '&#10003;' : '';
         const preview = item.previewMode === 'video'
-          ? `<div class="video-preview"><video preload="auto" muted playsinline src="${item.previewUrl}"></video><div class="fallback-icon">▶</div></div>`
+          ? cachedVideo?.posterDataUrl
+            ? `<img class="preview" loading="lazy" src="${cachedVideo.posterDataUrl}" alt="${escapeHtml(item.name)}">`
+            : `<div class="video-preview"><div class="video-loading"><div class="video-spinner"></div></div><div class="fallback-icon hidden">▶</div></div>`
           : item.previewMode === 'image'
-            ? `<img class="preview" loading="lazy" src="${item.previewUrl}" alt="${escapeHtml(item.name)}">`
+            ? `<div class="thumb-shell image-thumb"><img class="preview" loading="lazy" src="${item.previewUrl}" alt="${escapeHtml(item.name)}"><div class="thumb-loading"><div class="video-spinner"></div></div></div>`
             : buildImageFallbackMarkup(item);
 
         card.innerHTML = `
@@ -4225,42 +5228,281 @@ internal static class UiPage
           ${badgeMarkup}
           <div class="selector">${selectorText}</div>
           ${durationMarkup}
+          ${progressMarkup}
           <div class="card-footer">
             <h2 class="card-title">${escapeHtml(item.name)}</h2>
             <p class="card-path">${escapeHtml(item.relativePath)}</p>
           </div>
         `;
 
-        if (item.previewMode === 'video') {
-          const video = card.querySelector('video');
-          const fallback = card.querySelector('.fallback-icon');
-          const duration = card.querySelector('.duration');
-
-          video.addEventListener('loadedmetadata', () => {
-            if (Number.isFinite(video.duration)) {
-              duration.querySelector('.dur-text').textContent = formatDuration(video.duration);
-            }
-          });
-
-          video.addEventListener('loadeddata', () => {
-            fallback.style.display = 'none';
-          });
-
-          video.addEventListener('error', () => {
-            fallback.style.display = 'grid';
-            duration.querySelector('.dur-text').textContent = '0:00';
-          });
+        if (item.previewMode === 'video' && !cachedVideo) {
+          enqueueVideoHydration(item, card);
         }
 
-        const image = card.querySelector('img');
+        const imageThumb = card.querySelector('.image-thumb');
+        const image = imageThumb ? imageThumb.querySelector('img') : card.querySelector('img');
         if (image) {
+          if (imageThumb) {
+            const markLoaded = () => imageThumb.classList.add('loaded');
+            image.addEventListener('load', markLoaded);
+            if (image.complete && image.naturalWidth > 0) {
+              markLoaded();
+            }
+          }
+
           image.addEventListener('error', () => {
+            if (imageThumb) {
+              imageThumb.classList.add('error');
+              imageThumb.replaceWith(buildImageFallback(item));
+              return;
+            }
+
             image.replaceWith(buildImageFallback(item));
           });
         }
 
         grid.appendChild(card);
       }
+    }
+
+    function buildMediaCopyProgressMarkup(progressItem) {
+      if (!progressItem) {
+        return '';
+      }
+
+      if (progressItem.status !== 'running' && progressItem.status !== 'queued' && progressItem.status !== 'failed' && progressItem.status !== 'succeeded') {
+        return '';
+      }
+
+      const percent = progressPercentForItem(progressItem);
+      const barClasses = ['card-copy-progress-fill'];
+      if ((progressItem.status === 'running' || progressItem.status === 'queued') && (!progressItem.totalBytes || progressItem.totalBytes <= 0)) {
+        barClasses.push('indeterminate');
+      }
+
+      const containerClass = progressItem.status === 'failed' ? 'card-copy-progress failed' : 'card-copy-progress';
+      return `<div class="${containerClass}" title="${escapeHtml(statusTextForProgressItem(progressItem))}"><div class="${barClasses.join(' ')}" style="width:${percent.toFixed(2)}%"></div></div>`;
+    }
+
+    function enqueueVideoHydration(item, card) {
+      if (!item || state.videoHydrating.has(item.id) || state.videoPreviewCache.has(item.id)) {
+        return;
+      }
+
+      state.videoHydrating.add(item.id);
+      state.videoHydrationQueue.push({ item, card });
+      pumpVideoHydrationQueue();
+    }
+
+    function pumpVideoHydrationQueue() {
+      const maxConcurrent = 2;
+      while (state.videoHydrationActive < maxConcurrent && state.videoHydrationQueue.length > 0) {
+        const next = state.videoHydrationQueue.shift();
+        state.videoHydrationActive += 1;
+        hydrateVideoPreview(next.item, next.card)
+          .catch(() => { })
+          .finally(() => {
+            state.videoHydrationActive -= 1;
+            state.videoHydrating.delete(next.item.id);
+            pumpVideoHydrationQueue();
+          });
+      }
+    }
+
+    async function hydrateVideoPreview(item, card) {
+      const video = document.createElement('video');
+      video.preload = 'auto';
+      video.muted = true;
+      video.playsInline = true;
+      video.src = item.previewUrl;
+
+      await new Promise((resolve, reject) => {
+        const timeoutId = window.setTimeout(() => reject(new Error('Timed out loading video metadata.')), 15000);
+        video.addEventListener('loadedmetadata', async () => {
+          if (Number.isFinite(video.duration)) {
+            const durationText = formatDuration(video.duration);
+            const existing = state.videoPreviewCache.get(item.id) || {};
+            state.videoPreviewCache.set(item.id, { ...existing, durationText });
+            const duration = card.querySelector('.dur-text');
+            if (duration) {
+              duration.textContent = durationText;
+            }
+          }
+
+          try {
+            const posterDataUrl = await captureVideoPoster(video);
+            if (posterDataUrl) {
+              const existing = state.videoPreviewCache.get(item.id) || {};
+              state.videoPreviewCache.set(item.id, { ...existing, posterDataUrl });
+              applyVideoPosterToCard(card, item, posterDataUrl);
+            } else {
+              showVideoFallbackState(card);
+            }
+          } catch {
+            showVideoFallbackState(card);
+          }
+
+          window.clearTimeout(timeoutId);
+          resolve();
+        }, { once: true });
+
+        video.addEventListener('error', () => {
+          window.clearTimeout(timeoutId);
+          const duration = card.querySelector('.dur-text');
+          if (duration && duration.textContent === '--:--') {
+            duration.textContent = 'N/A';
+          }
+          showVideoFallbackState(card);
+          reject(new Error('Failed to load video metadata.'));
+        }, { once: true });
+      });
+    }
+
+    function showVideoFallbackState(card) {
+      const loading = card.querySelector('.video-loading');
+      const fallback = card.querySelector('.fallback-icon');
+      if (loading) {
+        loading.classList.add('hidden');
+      }
+      if (fallback) {
+        fallback.classList.remove('hidden');
+        fallback.style.display = 'grid';
+      }
+    }
+
+    async function captureVideoPoster(video) {
+      const duration = Number.isFinite(video.duration) ? video.duration : 0;
+      const timestamps = buildPosterCaptureTimestamps(duration);
+
+      for (const timestamp of timestamps) {
+        try {
+          const poster = await captureFrameAtTime(video, timestamp);
+          if (poster) {
+            return poster;
+          }
+        } catch { }
+      }
+
+      return null;
+    }
+
+    function buildPosterCaptureTimestamps(duration) {
+      const candidates = [0.45, 1.1, 2.0, duration * 0.2, duration * 0.4, duration * 0.65]
+        .filter(value => Number.isFinite(value) && value >= 0);
+
+      const upperBound = duration > 0.2 ? Math.max(0.1, duration - 0.05) : 0;
+      const clamped = candidates
+        .map(value => Math.min(value, upperBound))
+        .filter(value => value >= 0);
+
+      return [...new Set(clamped.map(value => Number(value.toFixed(2))))];
+    }
+
+    async function captureFrameAtTime(video, timestampSeconds) {
+      await seekVideo(video, timestampSeconds);
+
+      const targetSize = 360;
+      const canvas = document.createElement('canvas');
+      canvas.width = targetSize;
+      canvas.height = targetSize;
+      const context = canvas.getContext('2d', { willReadFrequently: true });
+      if (!context) {
+        return null;
+      }
+
+      const sourceWidth = video.videoWidth || targetSize;
+      const sourceHeight = video.videoHeight || targetSize;
+      const scale = Math.max(targetSize / sourceWidth, targetSize / sourceHeight);
+      const drawWidth = sourceWidth * scale;
+      const drawHeight = sourceHeight * scale;
+      const offsetX = (targetSize - drawWidth) / 2;
+      const offsetY = (targetSize - drawHeight) / 2;
+      context.drawImage(video, offsetX, offsetY, drawWidth, drawHeight);
+
+      if (isPosterLikelyBlack(canvas, context)) {
+        return null;
+      }
+
+      return canvas.toDataURL('image/jpeg', 0.75);
+    }
+
+    function seekVideo(video, timestampSeconds) {
+      return new Promise((resolve, reject) => {
+        if (!Number.isFinite(timestampSeconds) || timestampSeconds < 0) {
+          resolve();
+          return;
+        }
+
+        const timeout = window.setTimeout(() => reject(new Error('Seek timed out.')), 5000);
+        const onSeeked = () => {
+          window.clearTimeout(timeout);
+          video.removeEventListener('seeked', onSeeked);
+          resolve();
+        };
+
+        video.addEventListener('seeked', onSeeked, { once: true });
+        try {
+          video.currentTime = timestampSeconds;
+        } catch (error) {
+          window.clearTimeout(timeout);
+          video.removeEventListener('seeked', onSeeked);
+          reject(error);
+        }
+      });
+    }
+
+    function isPosterLikelyBlack(canvas, context) {
+      try {
+        const { width, height } = canvas;
+        const data = context.getImageData(0, 0, width, height).data;
+        const pixelCount = width * height;
+        if (!pixelCount || data.length < 4) {
+          return true;
+        }
+
+        const step = Math.max(1, Math.floor(pixelCount / 1200));
+        let sampled = 0;
+        let luminanceSum = 0;
+
+        for (let pixelIndex = 0; pixelIndex < pixelCount; pixelIndex += step) {
+          const i = pixelIndex * 4;
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
+          luminanceSum += (0.2126 * r) + (0.7152 * g) + (0.0722 * b);
+          sampled += 1;
+        }
+
+        if (sampled === 0) {
+          return true;
+        }
+
+        const averageLuminance = luminanceSum / sampled;
+        return averageLuminance < 20;
+      } catch {
+        return false;
+      }
+    }
+
+    function applyVideoPosterToCard(card, item, posterDataUrl) {
+      if (!posterDataUrl) {
+        return;
+      }
+
+      const currentPreview = card.querySelector('.video-preview');
+      if (!currentPreview) {
+        return;
+      }
+
+      const image = document.createElement('img');
+      image.className = 'preview';
+      image.loading = 'lazy';
+      image.alt = item.name;
+      image.src = posterDataUrl;
+      image.addEventListener('error', () => {
+        image.replaceWith(buildImageFallback(item));
+      });
+      currentPreview.replaceWith(image);
     }
 
     function renderFsList() {
@@ -4366,12 +5608,22 @@ internal static class UiPage
       renderSummary();
     }
 
-    async function loadMedia() {
+    async function loadMedia(forceRefresh = false) {
+      // A new scan starts a fresh media view; clear stale transfer bars from previous operations.
+      if (!state.transferProgressTimer) {
+        state.transferProgressSnapshot = null;
+        state.transferProgressOperationId = null;
+      }
+
       setBusy(true);
       setStatus('Scanning media from the device…');
 
       try {
-        const response = await fetch(`/api/media?includeAdditionalRoots=${includeAdditionalRootsInput.checked}`);
+        const cacheBuster = Date.now();
+        const response = await fetch(
+          `/api/media?includeAdditionalRoots=${includeAdditionalRootsInput.checked}&forceRefresh=${forceRefresh}&_=${cacheBuster}`,
+          { cache: 'no-store' }
+        );
         const data = await response.json();
 
         if (!response.ok) {
@@ -4400,12 +5652,13 @@ internal static class UiPage
       try {
         await fetch('/api/ptp-retry', { method: 'POST' });
       } catch { }
-      await loadMedia();
+      await loadMedia(true);
+      await refreshPtpStatus();
     }
 
-    async function resetCache() {
+    async function scanAndRecache() {
       setBusy(true);
-      setStatus('Resetting cache…');
+      setStatus('Resetting cache and rescanning media…');
       try {
         const response = await fetch('/api/cache/reset', { method: 'POST' });
         const data = await response.json();
@@ -4422,10 +5675,12 @@ internal static class UiPage
         renderFsSummary();
         state.ptpFallbackActive = false;
         retryPtpButton.classList.add('hidden');
-        setStatus('Cache cleared. Click Scan Media to reload.');
+
+        setBusy(false);
+        await loadMedia(true);
+        await refreshPtpStatus();
       } catch (error) {
         setStatus(error.message, true);
-      } finally {
         setBusy(false);
       }
     }
@@ -4499,7 +5754,8 @@ internal static class UiPage
             operation,
             includeAdditionalRoots: includeAdditionalRootsInput.checked,
             parallelism: settings.parallelism,
-            operationId
+            operationId,
+            photoNaming: settings.photoNaming
           })
         });
 
@@ -4513,7 +5769,11 @@ internal static class UiPage
         setStatus(`${data.message} ${data.localPaths.length} file(s) written.${note}`, failCount > 0);
         await fetchTransferProgress(operationId);
         await loadQueue();
-        await loadMedia();
+
+        const shouldAutoRefreshMedia = operation === 'move' || settings.autoRefreshAfterTransfer;
+        if (shouldAutoRefreshMedia) {
+          await loadMedia(true);
+        }
       } catch (error) {
         setStatus(error.message, true);
         await fetchTransferProgress(operationId);
@@ -4622,6 +5882,8 @@ internal static class UiPage
     parallelismInput.value = settings.parallelism;
     parallelismValue.textContent = settings.parallelism;
     loadQueue();
+    refreshPtpStatus();
+    ptpStatusTimer = window.setInterval(refreshPtpStatus, 7000);
   </script>
 </body>
 </html>
@@ -4684,6 +5946,13 @@ internal static class NativeMethods
     );
 
     [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int lockdownd_start_service_with_escrow_bag(
+      IntPtr client,
+      [MarshalAs(UnmanagedType.LPUTF8Str)] string identifier,
+      ref IntPtr serviceDescriptor
+    );
+
+    [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
     public static extern void lockdownd_service_descriptor_free(IntPtr serviceDescriptor);
 
     [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
@@ -4708,6 +5977,11 @@ internal static class NativeMethods
         uint length,
         ref uint bytesRead
     );
+
+    public const int AFC_SEEK_SET = 0;
+
+    [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int afc_file_seek(IntPtr afcClient, ulong handle, long offset, int whence);
 
     [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
     public static extern int afc_file_close(IntPtr afcClient, ulong handle);
