@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
@@ -271,6 +272,28 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             return;
         }
 
+        if (path == "/api/progress" && context.Request.HttpMethod == "GET")
+        {
+            string? operationId = context.Request.QueryString["operationId"];
+            if (string.IsNullOrWhiteSpace(operationId))
+            {
+                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                await WriteJsonResponseAsync(context.Response, new ErrorResponse("A transfer operation id is required."));
+                return;
+            }
+
+            TransferProgressResponse? snapshot = TransferProgressStore.GetSnapshot(operationId);
+            if (snapshot is null)
+            {
+                context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                await WriteJsonResponseAsync(context.Response, new ErrorResponse("The transfer operation was not found."));
+                return;
+            }
+
+            await WriteJsonResponseAsync(context.Response, snapshot);
+            return;
+        }
+
         if (path == "/api/fs/transfer" && context.Request.HttpMethod == "POST")
         {
             FsTransferRequest? request = await JsonSerializer.DeserializeAsync<FsTransferRequest>(context.Request.InputStream, AppJson.Options);
@@ -310,20 +333,46 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
 
             using AfcSession session = AfcSession.Connect(udid);
             List<FailedTransferItem> failures = [];
+            TransferProgressTracker? progressTracker = null;
 
             if (deleteOnly)
             {
+                List<TransferCopyWorkItem> deleteWorkItems = selectedPaths
+                    .Select(selectedPath => new TransferCopyWorkItem(
+                        Guid.NewGuid().ToString("N"),
+                        selectedPath,
+                        string.Empty,
+                        Path.GetFileName(selectedPath.TrimEnd('/')) is { Length: > 0 } name ? name : selectedPath
+                    ))
+                    .ToList();
+                progressTracker = TransferProgressStore.Create(request.OperationId, "Deleting file system items", deleteWorkItems);
+
                 foreach (string selectedPath in selectedPaths)
                 {
+                    TransferCopyWorkItem? matchingWorkItem = deleteWorkItems.FirstOrDefault(x => x.RemoteFilePath == selectedPath);
                     try
                     {
+                        if (matchingWorkItem is not null)
+                        {
+                            progressTracker.MarkStarted(matchingWorkItem.ItemId);
+                        }
                         DeleteRemotePathRecursive(session.AfcClient, selectedPath);
+                        if (matchingWorkItem is not null)
+                        {
+                            progressTracker.MarkProgress(matchingWorkItem.ItemId, 1, 1);
+                            progressTracker.MarkSucceeded(matchingWorkItem.ItemId);
+                        }
                     }
                     catch (Exception ex)
                     {
+                        if (matchingWorkItem is not null)
+                        {
+                            progressTracker.MarkFailed(matchingWorkItem.ItemId, ex.Message);
+                        }
                         failures.Add(new FailedTransferItem(selectedPath, null, ex.Message));
                     }
                 }
+                progressTracker.MarkCompleted();
 
                 AddToQueue(failures.Select(f => new QueuedTransferItem(
                     Guid.NewGuid().ToString(), f.RemoteFilePath, null, "delete", null, f.ErrorMessage, DateTimeOffset.UtcNow
@@ -337,7 +386,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             }
 
             // Enumerate all files first, then copy in parallel
-            List<(string RemoteFilePath, string LocalDestPath, string SelectedPath)> filesToCopy = [];
+            List<(TransferCopyWorkItem WorkItem, string SelectedPath)> filesToCopy = [];
             foreach (string selectedPath in selectedPaths)
             {
                 string selectionPath = NormalizeRemotePath(selectedPath);
@@ -347,12 +396,25 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                 foreach (string remoteFilePath in filePaths)
                 {
                     string localPath = BuildLocalOutputPathForSelection(request.DestinationDirectory!, selectionPath, remoteFilePath);
-                    filesToCopy.Add((remoteFilePath, localPath, selectionPath));
+                    filesToCopy.Add((
+                        new TransferCopyWorkItem(
+                            Guid.NewGuid().ToString("N"),
+                            remoteFilePath,
+                            localPath,
+                            Path.GetFileName(remoteFilePath) is { Length: > 0 } name ? name : remoteFilePath
+                        ),
+                        selectionPath
+                    ));
                 }
             }
+            progressTracker = TransferProgressStore.Create(
+                request.OperationId,
+                move ? "Moving file system items" : "Copying file system items",
+                filesToCopy.Select(x => x.WorkItem)
+            );
 
-            (List<(string RemoteFilePath, string LocalPath, byte[] SourceHash)> successes, List<FailedTransferItem> copyFailures) =
-                await ExecuteParallelCopiesAsync(udid, filesToCopy.Select(x => (x.RemoteFilePath, x.LocalDestPath)), request.Parallelism);
+            (List<(string ItemId, string RemoteFilePath, string LocalPath, byte[] SourceHash)> successes, List<FailedTransferItem> copyFailures) =
+                await ExecuteParallelCopiesAsync(udid, filesToCopy.Select(x => x.WorkItem), request.Parallelism, progressTracker);
 
             failures.AddRange(copyFailures);
 
@@ -360,7 +422,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             {
                 HashSet<string> failedRemotePaths = new(StringComparer.Ordinal);
 
-                foreach ((string remotePath, string localPath, byte[] sourceHash) in successes)
+                foreach ((string itemId, string remotePath, string localPath, byte[] sourceHash) in successes)
                 {
                     try
                     {
@@ -369,12 +431,14 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                         {
                             failures.Add(new FailedTransferItem(remotePath, localPath, "SHA-256 mismatch. Remote source file was not deleted."));
                             failedRemotePaths.Add(remotePath);
+                            progressTracker.MarkFailed(itemId, "SHA-256 mismatch. Remote source file was not deleted.");
                         }
                     }
                     catch (Exception ex)
                     {
                         failures.Add(new FailedTransferItem(remotePath, localPath, $"Hash verification failed: {ex.Message}"));
                         failedRemotePaths.Add(remotePath);
+                        progressTracker.MarkFailed(itemId, $"Hash verification failed: {ex.Message}");
                     }
                 }
 
@@ -383,7 +447,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                 {
                     bool allSucceeded = filesToCopy
                         .Where(x => x.SelectedPath == selectedPath)
-                        .All(x => !failedRemotePaths.Contains(x.RemoteFilePath));
+                        .All(x => !failedRemotePaths.Contains(x.WorkItem.RemoteFilePath));
 
                     if (allSucceeded)
                     {
@@ -398,6 +462,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                     }
                 }
             }
+            progressTracker.MarkCompleted();
 
             AddToQueue(failures.Select(f => new QueuedTransferItem(
                 Guid.NewGuid().ToString(), f.RemoteFilePath, f.LocalPath, operation, request.DestinationDirectory, f.ErrorMessage, DateTimeOffset.UtcNow
@@ -441,7 +506,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             IReadOnlyList<MediaAsset> assets = EnumerateMediaAssets(session.AfcClient, request.IncludeAdditionalRoots).Assets;
             Dictionary<string, MediaAsset> assetsById = assets.ToDictionary(x => x.Id, StringComparer.Ordinal);
 
-            List<(string RemoteFilePath, string LocalDestPath)> filesToCopy = [];
+            List<TransferCopyWorkItem> filesToCopy = [];
             foreach (string assetId in request.AssetIds.Distinct(StringComparer.Ordinal))
             {
                 if (!assetsById.TryGetValue(assetId, out MediaAsset? asset))
@@ -454,17 +519,27 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                 foreach (string remotePath in asset.RemotePaths)
                 {
                     string localPath = BuildLocalOutputPath(request.DestinationDirectory, remotePath);
-                    filesToCopy.Add((remotePath, localPath));
+                    filesToCopy.Add(new TransferCopyWorkItem(
+                        Guid.NewGuid().ToString("N"),
+                        remotePath,
+                        localPath,
+                        Path.GetFileName(remotePath) is { Length: > 0 } name ? name : remotePath
+                    ));
                 }
             }
+            TransferProgressTracker progressTracker = TransferProgressStore.Create(
+                request.OperationId,
+                deleteAfterCopy ? "Moving media items" : "Copying media items",
+                filesToCopy
+            );
 
-            (List<(string RemoteFilePath, string LocalPath, byte[] SourceHash)> successes, List<FailedTransferItem> failures) =
-                await ExecuteParallelCopiesAsync(udid, filesToCopy, request.Parallelism);
+            (List<(string ItemId, string RemoteFilePath, string LocalPath, byte[] SourceHash)> successes, List<FailedTransferItem> failures) =
+                await ExecuteParallelCopiesAsync(udid, filesToCopy, request.Parallelism, progressTracker);
 
             if (deleteAfterCopy && successes.Count > 0)
             {
                 HashSet<string> failedRemotePaths = new(StringComparer.Ordinal);
-                foreach ((string remotePath, string localPath, byte[] sourceHash) in successes)
+                foreach ((string itemId, string remotePath, string localPath, byte[] sourceHash) in successes)
                 {
                     try
                     {
@@ -473,16 +548,18 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                         {
                             failures.Add(new FailedTransferItem(remotePath, localPath, "SHA-256 mismatch. Remote source file was not deleted."));
                             failedRemotePaths.Add(remotePath);
+                            progressTracker.MarkFailed(itemId, "SHA-256 mismatch. Remote source file was not deleted.");
                         }
                     }
                     catch (Exception ex)
                     {
                         failures.Add(new FailedTransferItem(remotePath, localPath, $"Hash verification failed: {ex.Message}"));
                         failedRemotePaths.Add(remotePath);
+                        progressTracker.MarkFailed(itemId, $"Hash verification failed: {ex.Message}");
                     }
                 }
 
-                foreach ((string remotePath, _, _) in successes)
+                foreach ((string itemId, string remotePath, _, _) in successes)
                 {
                     if (failedRemotePaths.Contains(remotePath)) continue;
                     try
@@ -492,9 +569,11 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                     catch (Exception ex)
                     {
                         failures.Add(new FailedTransferItem(remotePath, null, $"Delete after copy failed: {ex.Message}"));
+                        progressTracker.MarkFailed(itemId, $"Delete after copy failed: {ex.Message}");
                     }
                 }
             }
+            progressTracker.MarkCompleted();
 
             AddToQueue(failures.Select(f => new QueuedTransferItem(
                 Guid.NewGuid().ToString(), f.RemoteFilePath, f.LocalPath, request.Operation, request.DestinationDirectory, f.ErrorMessage, DateTimeOffset.UtcNow
@@ -725,12 +804,13 @@ static void AddToQueue(IEnumerable<QueuedTransferItem> items)
     }
 }
 
-static async Task<(List<(string RemoteFilePath, string LocalPath, byte[] SourceHash)> Successes, List<FailedTransferItem> Failures)> ExecuteParallelCopiesAsync(
+static async Task<(List<(string ItemId, string RemoteFilePath, string LocalPath, byte[] SourceHash)> Successes, List<FailedTransferItem> Failures)> ExecuteParallelCopiesAsync(
     string? udid,
-    IEnumerable<(string RemoteFilePath, string LocalDestPath)> filesToCopy,
-    int parallelism)
+    IEnumerable<TransferCopyWorkItem> filesToCopy,
+    int parallelism,
+    TransferProgressTracker? progressTracker = null)
 {
-    List<(string RemoteFilePath, string LocalPath, byte[] SourceHash)> successes = [];
+    List<(string ItemId, string RemoteFilePath, string LocalPath, byte[] SourceHash)> successes = [];
     List<FailedTransferItem> failures = [];
     object resultLock = new();
     int maxDegree = Math.Max(1, Math.Min(16, parallelism));
@@ -743,11 +823,19 @@ static async Task<(List<(string RemoteFilePath, string LocalPath, byte[] SourceH
             try
             {
                 using AfcSession taskSession = AfcSession.Connect(udid);
-                byte[] hash = CopyRemoteFileToLocalAndComputeHash(taskSession.AfcClient, item.RemoteFilePath, item.LocalDestPath);
-                lock (resultLock) { successes.Add((item.RemoteFilePath, item.LocalDestPath, hash)); }
+                progressTracker?.MarkStarted(item.ItemId);
+                byte[] hash = CopyRemoteFileToLocalAndComputeHash(
+                    taskSession.AfcClient,
+                    item.RemoteFilePath,
+                    item.LocalDestPath,
+                    (copiedBytes, totalBytes) => progressTracker?.MarkProgress(item.ItemId, copiedBytes, totalBytes)
+                );
+                progressTracker?.MarkSucceeded(item.ItemId);
+                lock (resultLock) { successes.Add((item.ItemId, item.RemoteFilePath, item.LocalDestPath, hash)); }
             }
             catch (Exception ex)
             {
+                progressTracker?.MarkFailed(item.ItemId, ex.Message);
                 lock (resultLock) { failures.Add(new FailedTransferItem(item.RemoteFilePath, item.LocalDestPath, ex.Message)); }
             }
             return ValueTask.CompletedTask;
@@ -1200,8 +1288,19 @@ static string BuildLocalOutputPath(string destinationDirectory, string remotePat
     return Path.Combine(destinationDirectory, Path.Combine(segments));
 }
 
-static byte[] CopyRemoteFileToLocalAndComputeHash(IntPtr afcClient, string remotePath, string localPath)
+static byte[] CopyRemoteFileToLocalAndComputeHash(IntPtr afcClient, string remotePath, string localPath, Action<long, long?>? onProgress = null)
 {
+    long? totalBytes = null;
+    try
+    {
+        totalBytes = GetRemoteEntryInfo(afcClient, remotePath).SizeBytes;
+    }
+    catch
+    {
+        totalBytes = null;
+    }
+    onProgress?.Invoke(0, totalBytes);
+
     ulong afcFileHandle = 0;
     ThrowIfError(
         NativeMethods.afc_file_open(afcClient, remotePath, NativeMethods.AFC_FOPEN_RDONLY, ref afcFileHandle),
@@ -1219,6 +1318,7 @@ static byte[] CopyRemoteFileToLocalAndComputeHash(IntPtr afcClient, string remot
         using FileStream output = File.Create(localPath);
         using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         byte[] buffer = new byte[64 * 1024];
+        long copiedBytes = 0;
 
         while (true)
         {
@@ -1235,6 +1335,8 @@ static byte[] CopyRemoteFileToLocalAndComputeHash(IntPtr afcClient, string remot
 
             hash.AppendData(buffer, 0, (int)bytesRead);
             output.Write(buffer, 0, (int)bytesRead);
+            copiedBytes += bytesRead;
+            onProgress?.Invoke(copiedBytes, totalBytes);
         }
 
         output.Flush();
@@ -1536,11 +1638,11 @@ internal sealed record MediaAssetView(
 
 internal sealed record MediaLibraryResponse(MediaAssetView[] Items, int PhotoCount, int LivePhotoCount, int VideoCount, string[] ScannedRoots);
 
-internal sealed record TransferRequest(string[] AssetIds, string DestinationDirectory, string Operation, bool IncludeAdditionalRoots, int Parallelism = 4);
+internal sealed record TransferRequest(string[] AssetIds, string DestinationDirectory, string Operation, bool IncludeAdditionalRoots, int Parallelism = 4, string? OperationId = null);
 
 internal sealed record TransferResponse(string Message, string[] LocalPaths, FailedTransferItem[] FailedItems);
 
-internal sealed record FsTransferRequest(string[] SelectedPaths, string? DestinationDirectory, string Operation, int Parallelism = 4);
+internal sealed record FsTransferRequest(string[] SelectedPaths, string? DestinationDirectory, string Operation, int Parallelism = 4, string? OperationId = null);
 
 internal sealed record RemoteFsEntry(string Name, string Path, bool IsDirectory, bool IsFile, long? SizeBytes);
 
@@ -1561,6 +1663,198 @@ internal sealed record QueuedTransferItem(
 );
 
 internal sealed record RetryQueueRequest(string[]? Ids);
+
+internal sealed record TransferCopyWorkItem(string ItemId, string RemoteFilePath, string LocalDestPath, string DisplayName);
+
+internal sealed record TransferProgressFileView(
+    string ItemId,
+    string Name,
+    string RemotePath,
+    string Status,
+    long BytesCopied,
+    long? TotalBytes,
+    string? ErrorMessage
+);
+
+internal sealed record TransferProgressResponse(
+    string OperationId,
+    string Label,
+    int TotalCount,
+    int CompletedCount,
+    bool IsComplete,
+    TransferProgressFileView[] Items
+);
+
+internal sealed class TransferProgressTracker
+{
+    private readonly object gate = new();
+    private readonly Dictionary<string, TransferProgressItemState> itemsById;
+    private readonly string operationId;
+    private readonly string label;
+    private DateTimeOffset? completedAtUtc;
+
+    public TransferProgressTracker(string operationId, string label, IEnumerable<TransferCopyWorkItem> items)
+    {
+        this.operationId = operationId;
+        this.label = label;
+        itemsById = items.ToDictionary(
+            item => item.ItemId,
+            item => new TransferProgressItemState(item.ItemId, item.DisplayName, item.RemoteFilePath),
+            StringComparer.Ordinal
+        );
+    }
+
+    public string OperationId => operationId;
+    public DateTimeOffset? CompletedAtUtc
+    {
+        get { lock (gate) { return completedAtUtc; } }
+    }
+
+    public void MarkStarted(string itemId)
+    {
+        lock (gate)
+        {
+            if (!itemsById.TryGetValue(itemId, out TransferProgressItemState? item)) return;
+            item.Status = "running";
+        }
+    }
+
+    public void MarkProgress(string itemId, long copiedBytes, long? totalBytes)
+    {
+        lock (gate)
+        {
+            if (!itemsById.TryGetValue(itemId, out TransferProgressItemState? item)) return;
+            item.Status = "running";
+            item.BytesCopied = Math.Max(0, copiedBytes);
+            if (totalBytes.HasValue && totalBytes.Value >= 0)
+            {
+                item.TotalBytes = totalBytes.Value;
+            }
+        }
+    }
+
+    public void MarkSucceeded(string itemId)
+    {
+        lock (gate)
+        {
+            if (!itemsById.TryGetValue(itemId, out TransferProgressItemState? item)) return;
+            if (item.TotalBytes.HasValue && item.TotalBytes.Value >= item.BytesCopied)
+            {
+                item.BytesCopied = item.TotalBytes.Value;
+            }
+            item.Status = "succeeded";
+        }
+    }
+
+    public void MarkFailed(string itemId, string errorMessage)
+    {
+        lock (gate)
+        {
+            if (!itemsById.TryGetValue(itemId, out TransferProgressItemState? item)) return;
+            item.Status = "failed";
+            item.ErrorMessage = errorMessage;
+        }
+    }
+
+    public void MarkCompleted()
+    {
+        lock (gate)
+        {
+            if (completedAtUtc is null)
+            {
+                completedAtUtc = DateTimeOffset.UtcNow;
+            }
+        }
+    }
+
+    public TransferProgressResponse Snapshot()
+    {
+        lock (gate)
+        {
+            TransferProgressFileView[] items = itemsById.Values
+                .Select(item => new TransferProgressFileView(
+                    item.ItemId,
+                    item.Name,
+                    item.RemotePath,
+                    item.Status,
+                    item.BytesCopied,
+                    item.TotalBytes,
+                    item.ErrorMessage
+                ))
+                .ToArray();
+            int completedCount = items.Count(item => item.Status is "succeeded" or "failed");
+            bool done = completedAtUtc.HasValue && completedCount >= items.Length;
+            return new TransferProgressResponse(
+                operationId,
+                label,
+                items.Length,
+                completedCount,
+                done,
+                items
+            );
+        }
+    }
+
+    private sealed class TransferProgressItemState
+    {
+        public TransferProgressItemState(string itemId, string name, string remotePath)
+        {
+            ItemId = itemId;
+            Name = name;
+            RemotePath = remotePath;
+            Status = "pending";
+            BytesCopied = 0;
+        }
+
+        public string ItemId { get; }
+        public string Name { get; }
+        public string RemotePath { get; }
+        public string Status { get; set; }
+        public long BytesCopied { get; set; }
+        public long? TotalBytes { get; set; }
+        public string? ErrorMessage { get; set; }
+    }
+}
+
+internal static class TransferProgressStore
+{
+    private static readonly ConcurrentDictionary<string, TransferProgressTracker> Operations = new(StringComparer.Ordinal);
+    private const int RetentionMinutes = 10;
+
+    public static TransferProgressTracker Create(string? requestedOperationId, string label, IEnumerable<TransferCopyWorkItem> items)
+    {
+        CleanupExpired();
+        string operationId = string.IsNullOrWhiteSpace(requestedOperationId)
+            ? Guid.NewGuid().ToString("N")
+            : requestedOperationId.Trim();
+        TransferProgressTracker tracker = new(operationId, label, items);
+        Operations[operationId] = tracker;
+        return tracker;
+    }
+
+    public static TransferProgressResponse? GetSnapshot(string operationId)
+    {
+        CleanupExpired();
+        if (!Operations.TryGetValue(operationId, out TransferProgressTracker? tracker))
+        {
+            return null;
+        }
+
+        return tracker.Snapshot();
+    }
+
+    private static void CleanupExpired()
+    {
+        DateTimeOffset cutoff = DateTimeOffset.UtcNow.AddMinutes(-RetentionMinutes);
+        foreach ((string key, TransferProgressTracker value) in Operations)
+        {
+            if (value.CompletedAtUtc is { } completed && completed < cutoff)
+            {
+                Operations.TryRemove(key, out _);
+            }
+        }
+    }
+}
 
 internal static class NativeError
 {
@@ -1762,6 +2056,84 @@ internal static class UiPage
       font-size: .98rem;
     }
     .status.error { color: #b63838; }
+    .transfer-progress-panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      padding: 10px 12px;
+      margin-bottom: 14px;
+      display: grid;
+      gap: 8px;
+    }
+    .transfer-progress-summary {
+      color: var(--muted);
+      font-size: .9rem;
+    }
+    .transfer-progress-list {
+      max-height: 240px;
+      overflow: auto;
+      display: grid;
+      gap: 8px;
+      padding-right: 2px;
+    }
+    .tp-row {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: rgba(255,255,255,0.72);
+      display: grid;
+      gap: 6px;
+    }
+    .tp-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+      font-size: .87rem;
+    }
+    .tp-name {
+      font-weight: 600;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .tp-status {
+      color: var(--muted);
+      white-space: nowrap;
+      font-size: .82rem;
+    }
+    .tp-status.failed { color: #b63838; }
+    .tp-status.succeeded { color: #2b7a3e; }
+    .tp-track {
+      height: 8px;
+      background: color-mix(in srgb, #2867ff 15%, transparent);
+      border-radius: 999px;
+      overflow: hidden;
+      position: relative;
+    }
+    .tp-fill {
+      height: 100%;
+      width: 0%;
+      background: #2867ff;
+      transition: width .2s ease;
+    }
+    .tp-fill.running.indeterminate {
+      width: 40%;
+      animation: indeterminate 1.2s ease-in-out infinite;
+    }
+    .tp-fill.failed {
+      background: #c03838;
+    }
+    .tp-fill.succeeded {
+      background: #2b7a3e;
+    }
+    .tp-path {
+      color: var(--muted);
+      font-size: .8rem;
+      word-break: break-all;
+    }
     .grid {
       display: grid;
       gap: 16px;
@@ -2146,6 +2518,10 @@ internal static class UiPage
 
     <div class="progress-bar" id="progressBar"></div>
     <div class="status" id="status">Choose options and click Scan Media to start.</div>
+    <div class="transfer-progress-panel hidden" id="transferProgressPanel">
+      <div class="transfer-progress-summary" id="transferProgressSummary"></div>
+      <div class="transfer-progress-list" id="transferProgressList"></div>
+    </div>
 
     <div id="mediaView">
       <div class="summary" id="summary"></div>
@@ -2301,7 +2677,9 @@ internal static class UiPage
       fsCurrentPath: 'DCIM',
       fsParentPath: '/',
       fsEntries: [],
-      fsSelected: new Set()
+      fsSelected: new Set(),
+      transferProgressOperationId: null,
+      transferProgressTimer: null
     };
 
     const summary = document.getElementById('summary');
@@ -2346,6 +2724,9 @@ internal static class UiPage
     const queueTitle = document.getElementById('queueTitle');
     const retryAllButton = document.getElementById('retryAllButton');
     const clearQueueButton = document.getElementById('clearQueueButton');
+    const transferProgressPanel = document.getElementById('transferProgressPanel');
+    const transferProgressSummary = document.getElementById('transferProgressSummary');
+    const transferProgressList = document.getElementById('transferProgressList');
 
     filterInput.addEventListener('change', () => {
       state.filter = filterInput.value;
@@ -2419,6 +2800,99 @@ internal static class UiPage
     function setStatus(message, isError = false) {
       status.textContent = message;
       status.classList.toggle('error', isError);
+    }
+
+    function createOperationId() {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+      }
+      return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+
+    function statusTextForProgressItem(item) {
+      if (item.status === 'failed') return item.errorMessage || 'Failed';
+      if (item.status === 'succeeded') return 'Done';
+      if (item.status === 'running') return item.totalBytes > 0
+        ? `${formatBytes(item.bytesCopied)} / ${formatBytes(item.totalBytes)}`
+        : 'In progress…';
+      return 'Queued';
+    }
+
+    function progressPercentForItem(item) {
+      if (item.status === 'succeeded') return 100;
+      if (item.status === 'failed') return item.totalBytes > 0 ? Math.min(100, (item.bytesCopied / item.totalBytes) * 100) : 100;
+      if (!item.totalBytes || item.totalBytes <= 0) return 0;
+      return Math.min(100, Math.max(0, (item.bytesCopied / item.totalBytes) * 100));
+    }
+
+    function renderTransferProgress(progress) {
+      if (!progress) {
+        transferProgressPanel.classList.add('hidden');
+        transferProgressList.innerHTML = '';
+        transferProgressSummary.textContent = '';
+        return;
+      }
+
+      transferProgressPanel.classList.remove('hidden');
+      transferProgressSummary.textContent = `${progress.label}: ${progress.completedCount}/${progress.totalCount} complete`;
+
+      if (!progress.items || progress.items.length === 0) {
+        transferProgressList.innerHTML = '<div class="empty">Preparing transfer list…</div>';
+        return;
+      }
+
+      transferProgressList.innerHTML = '';
+      for (const item of progress.items) {
+        const row = document.createElement('div');
+        row.className = 'tp-row';
+        const percent = progressPercentForItem(item);
+        const fillClasses = ['tp-fill', item.status];
+        if (item.status === 'running' && (!item.totalBytes || item.totalBytes <= 0)) {
+          fillClasses.push('indeterminate');
+        }
+
+        row.innerHTML = `
+          <div class="tp-head">
+            <div class="tp-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</div>
+            <div class="tp-status ${escapeHtml(item.status)}">${escapeHtml(statusTextForProgressItem(item))}</div>
+          </div>
+          <div class="tp-track">
+            <div class="${fillClasses.join(' ')}" style="width:${percent.toFixed(2)}%"></div>
+          </div>
+          <div class="tp-path">${escapeHtml(item.remotePath)}</div>
+        `;
+        transferProgressList.appendChild(row);
+      }
+    }
+
+    async function fetchTransferProgress(operationId) {
+      if (!operationId) return;
+      try {
+        const response = await fetch(`/api/progress?operationId=${encodeURIComponent(operationId)}`);
+        if (!response.ok) return;
+        const progress = await response.json();
+        renderTransferProgress(progress);
+      } catch { }
+    }
+
+    function startTransferProgress(operationId, label) {
+      stopTransferProgressPolling();
+      state.transferProgressOperationId = operationId;
+      renderTransferProgress({
+        label,
+        completedCount: 0,
+        totalCount: 0,
+        items: []
+      });
+      fetchTransferProgress(operationId);
+      state.transferProgressTimer = window.setInterval(() => fetchTransferProgress(operationId), 350);
+    }
+
+    function stopTransferProgressPolling() {
+      if (state.transferProgressTimer) {
+        window.clearInterval(state.transferProgressTimer);
+        state.transferProgressTimer = null;
+      }
     }
 
     function openSettings() {
@@ -2853,6 +3327,8 @@ internal static class UiPage
 
       setBusy(true);
       setStatus(`${operation === 'move' ? 'Moving' : 'Copying'} selected media items…`);
+      const operationId = createOperationId();
+      startTransferProgress(operationId, `${operation === 'move' ? 'Move' : 'Copy'} media`);
 
       try {
         const response = await fetch('/api/transfer', {
@@ -2863,7 +3339,8 @@ internal static class UiPage
             destinationDirectory,
             operation,
             includeAdditionalRoots: includeAdditionalRootsInput.checked,
-            parallelism: settings.parallelism
+            parallelism: settings.parallelism,
+            operationId
           })
         });
 
@@ -2875,11 +3352,14 @@ internal static class UiPage
         const failCount = data.failedItems ? data.failedItems.length : 0;
         const note = failCount > 0 ? ` ⚠ ${failCount} file(s) failed — see queue below.` : '';
         setStatus(`${data.message} ${data.localPaths.length} file(s) written.${note}`, failCount > 0);
+        await fetchTransferProgress(operationId);
         await loadQueue();
         await loadMedia();
       } catch (error) {
         setStatus(error.message, true);
+        await fetchTransferProgress(operationId);
       } finally {
+        stopTransferProgressPolling();
         setBusy(false);
       }
     }
@@ -2907,6 +3387,8 @@ internal static class UiPage
 
       setBusy(true);
       setStatus(`${operation[0].toUpperCase() + operation.slice(1)} selected file system items…`);
+      const operationId = createOperationId();
+      startTransferProgress(operationId, `${operation[0].toUpperCase() + operation.slice(1)} file system items`);
 
       try {
         const response = await fetch('/api/fs/transfer', {
@@ -2916,7 +3398,8 @@ internal static class UiPage
             selectedPaths: Array.from(state.fsSelected),
             destinationDirectory: operation === 'delete' ? null : destinationDirectory,
             operation,
-            parallelism: settings.parallelism
+            parallelism: settings.parallelism,
+            operationId
           })
         });
 
@@ -2929,11 +3412,14 @@ internal static class UiPage
         const countNote = operation === 'delete' ? '' : ` ${data.localPaths.length} file(s) written.`;
         const failNote = failCount > 0 ? ` ⚠ ${failCount} item(s) failed — see queue below.` : '';
         setStatus(`${data.message}${countNote}${failNote}`, failCount > 0);
+        await fetchTransferProgress(operationId);
         await loadQueue();
         await loadFs(state.fsCurrentPath);
       } catch (error) {
         setStatus(error.message, true);
+        await fetchTransferProgress(operationId);
       } finally {
+        stopTransferProgressPolling();
         setBusy(false);
       }
     }
