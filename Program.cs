@@ -309,60 +309,108 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             }
 
             using AfcSession session = AfcSession.Connect(udid);
+            List<FailedTransferItem> failures = [];
 
             if (deleteOnly)
             {
                 foreach (string selectedPath in selectedPaths)
                 {
-                    DeleteRemotePathRecursive(session.AfcClient, selectedPath);
+                    try
+                    {
+                        DeleteRemotePathRecursive(session.AfcClient, selectedPath);
+                    }
+                    catch (Exception ex)
+                    {
+                        failures.Add(new FailedTransferItem(selectedPath, null, ex.Message));
+                    }
                 }
+
+                AddToQueue(failures.Select(f => new QueuedTransferItem(
+                    Guid.NewGuid().ToString(), f.RemoteFilePath, null, "delete", null, f.ErrorMessage, DateTimeOffset.UtcNow
+                )));
 
                 await WriteJsonResponseAsync(
                     context.Response,
-                    new TransferResponse("Deleted the selected items.", Array.Empty<string>())
+                    new TransferResponse("Deleted the selected items.", Array.Empty<string>(), failures.ToArray())
                 );
                 return;
             }
 
-            List<(string SelectedPath, string RemoteFilePath, string LocalPath, byte[] SourceHash)> transferredFiles = [];
+            // Enumerate all files first, then copy in parallel
+            List<(string RemoteFilePath, string LocalDestPath, string SelectedPath)> filesToCopy = [];
             foreach (string selectedPath in selectedPaths)
             {
                 string selectionPath = NormalizeRemotePath(selectedPath);
                 RemoteEntryInfo info = GetRemoteEntryInfo(session.AfcClient, selectionPath);
-                IReadOnlyList<string> filesToCopy = EnumerateRemoteFilesForSelection(session.AfcClient, selectionPath, info);
+                IReadOnlyList<string> filePaths = EnumerateRemoteFilesForSelection(session.AfcClient, selectionPath, info);
 
-                foreach (string remoteFilePath in filesToCopy)
+                foreach (string remoteFilePath in filePaths)
                 {
                     string localPath = BuildLocalOutputPathForSelection(request.DestinationDirectory!, selectionPath, remoteFilePath);
-                    byte[] sourceHash = CopyRemoteFileToLocalAndComputeHash(session.AfcClient, remoteFilePath, localPath);
-                    transferredFiles.Add((selectionPath, remoteFilePath, localPath, sourceHash));
+                    filesToCopy.Add((remoteFilePath, localPath, selectionPath));
                 }
             }
 
-            if (move)
+            (List<(string RemoteFilePath, string LocalPath, byte[] SourceHash)> successes, List<FailedTransferItem> copyFailures) =
+                await ExecuteParallelCopiesAsync(udid, filesToCopy.Select(x => (x.RemoteFilePath, x.LocalDestPath)), request.Parallelism);
+
+            failures.AddRange(copyFailures);
+
+            if (move && successes.Count > 0)
             {
-                foreach ((_, string remoteFilePath, string localPath, byte[] sourceHash) in transferredFiles)
+                HashSet<string> failedRemotePaths = new(StringComparer.Ordinal);
+
+                foreach ((string remotePath, string localPath, byte[] sourceHash) in successes)
                 {
-                    byte[] localHash = ComputeLocalFileHash(localPath);
-                    if (!CryptographicOperations.FixedTimeEquals(sourceHash, localHash))
+                    try
                     {
-                        throw new InvalidOperationException(
-                            $"SHA-256 mismatch for '{remoteFilePath}' and '{localPath}'. Remote source files were not deleted."
-                        );
+                        byte[] localHash = ComputeLocalFileHash(localPath);
+                        if (!CryptographicOperations.FixedTimeEquals(sourceHash, localHash))
+                        {
+                            failures.Add(new FailedTransferItem(remotePath, localPath, "SHA-256 mismatch. Remote source file was not deleted."));
+                            failedRemotePaths.Add(remotePath);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        failures.Add(new FailedTransferItem(remotePath, localPath, $"Hash verification failed: {ex.Message}"));
+                        failedRemotePaths.Add(remotePath);
                     }
                 }
 
+                // Only delete selections where all files verified successfully
                 foreach (string selectedPath in selectedPaths)
                 {
-                    DeleteRemotePathRecursive(session.AfcClient, selectedPath);
+                    bool allSucceeded = filesToCopy
+                        .Where(x => x.SelectedPath == selectedPath)
+                        .All(x => !failedRemotePaths.Contains(x.RemoteFilePath));
+
+                    if (allSucceeded)
+                    {
+                        try
+                        {
+                            DeleteRemotePathRecursive(session.AfcClient, selectedPath);
+                        }
+                        catch (Exception ex)
+                        {
+                            failures.Add(new FailedTransferItem(selectedPath, null, $"Delete after copy failed: {ex.Message}"));
+                        }
+                    }
                 }
             }
+
+            AddToQueue(failures.Select(f => new QueuedTransferItem(
+                Guid.NewGuid().ToString(), f.RemoteFilePath, f.LocalPath, operation, request.DestinationDirectory, f.ErrorMessage, DateTimeOffset.UtcNow
+            )));
+
+            string[] writtenPaths = successes.Select(x => x.LocalPath).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
 
             await WriteJsonResponseAsync(
                 context.Response,
                 new TransferResponse(
                     move ? "Moved the selected items." : "Copied the selected items.",
-                    transferredFiles.Select(x => x.LocalPath).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
+                    writtenPaths,
+                    failures.ToArray()
                 )
             );
 
@@ -392,54 +440,172 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             using AfcSession session = AfcSession.Connect(udid);
             IReadOnlyList<MediaAsset> assets = EnumerateMediaAssets(session.AfcClient, request.IncludeAdditionalRoots).Assets;
             Dictionary<string, MediaAsset> assetsById = assets.ToDictionary(x => x.Id, StringComparer.Ordinal);
-            List<string> copiedPaths = [];
 
+            List<(string RemoteFilePath, string LocalDestPath)> filesToCopy = [];
             foreach (string assetId in request.AssetIds.Distinct(StringComparer.Ordinal))
             {
                 if (!assetsById.TryGetValue(assetId, out MediaAsset? asset))
                 {
-                    throw new InvalidOperationException("One of the selected media items is no longer available on the device.");
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteJsonResponseAsync(context.Response, new ErrorResponse("One of the selected media items is no longer available on the device."));
+                    return;
                 }
-
-                List<(string RemotePath, string LocalPath, byte[] SourceHash)> transferredFiles = [];
 
                 foreach (string remotePath in asset.RemotePaths)
                 {
                     string localPath = BuildLocalOutputPath(request.DestinationDirectory, remotePath);
-                    byte[] sourceHash = CopyRemoteFileToLocalAndComputeHash(session.AfcClient, remotePath, localPath);
-                    transferredFiles.Add((remotePath, localPath, sourceHash));
-                    copiedPaths.Add(localPath);
+                    filesToCopy.Add((remotePath, localPath));
                 }
+            }
 
-                if (deleteAfterCopy)
+            (List<(string RemoteFilePath, string LocalPath, byte[] SourceHash)> successes, List<FailedTransferItem> failures) =
+                await ExecuteParallelCopiesAsync(udid, filesToCopy, request.Parallelism);
+
+            if (deleteAfterCopy && successes.Count > 0)
+            {
+                HashSet<string> failedRemotePaths = new(StringComparer.Ordinal);
+                foreach ((string remotePath, string localPath, byte[] sourceHash) in successes)
                 {
-                    foreach ((string remotePath, string localPath, byte[] sourceHash) in transferredFiles)
+                    try
                     {
                         byte[] localHash = ComputeLocalFileHash(localPath);
-
                         if (!CryptographicOperations.FixedTimeEquals(sourceHash, localHash))
                         {
-                            throw new InvalidOperationException(
-                                $"SHA-256 mismatch for '{remotePath}' and '{localPath}'. Remote source files were not deleted."
-                            );
+                            failures.Add(new FailedTransferItem(remotePath, localPath, "SHA-256 mismatch. Remote source file was not deleted."));
+                            failedRemotePaths.Add(remotePath);
                         }
                     }
+                    catch (Exception ex)
+                    {
+                        failures.Add(new FailedTransferItem(remotePath, localPath, $"Hash verification failed: {ex.Message}"));
+                        failedRemotePaths.Add(remotePath);
+                    }
+                }
 
-                    foreach ((string remotePath, _, _) in transferredFiles)
+                foreach ((string remotePath, _, _) in successes)
+                {
+                    if (failedRemotePaths.Contains(remotePath)) continue;
+                    try
                     {
                         ThrowIfError(NativeMethods.afc_remove_path(session.AfcClient, remotePath), $"Unable to delete remote file '{remotePath}'");
                     }
+                    catch (Exception ex)
+                    {
+                        failures.Add(new FailedTransferItem(remotePath, null, $"Delete after copy failed: {ex.Message}"));
+                    }
                 }
             }
+
+            AddToQueue(failures.Select(f => new QueuedTransferItem(
+                Guid.NewGuid().ToString(), f.RemoteFilePath, f.LocalPath, request.Operation, request.DestinationDirectory, f.ErrorMessage, DateTimeOffset.UtcNow
+            )));
+
+            string[] copiedPaths = successes.Select(x => x.LocalPath).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
 
             await WriteJsonResponseAsync(
                 context.Response,
                 new TransferResponse(
                     deleteAfterCopy ? "Moved the selected items." : "Copied the selected items.",
-                    copiedPaths.ToArray()
+                    copiedPaths,
+                    failures.ToArray()
                 )
             );
 
+            return;
+        }
+
+        if (path == "/api/queue" && context.Request.HttpMethod == "GET")
+        {
+            List<QueuedTransferItem> queue;
+            lock (AppJson.QueueFileLock)
+            {
+                queue = LoadQueue();
+            }
+            await WriteJsonResponseAsync(context.Response, queue);
+            return;
+        }
+
+        if (path == "/api/queue" && context.Request.HttpMethod == "DELETE")
+        {
+            string? id = context.Request.QueryString["id"];
+            lock (AppJson.QueueFileLock)
+            {
+                List<QueuedTransferItem> queue = LoadQueue();
+                if (!string.IsNullOrEmpty(id))
+                    queue.RemoveAll(x => x.Id == id);
+                else
+                    queue.Clear();
+                SaveQueue(queue);
+            }
+            await WriteJsonResponseAsync(context.Response, new { message = "Queue updated." });
+            return;
+        }
+
+        if (path == "/api/queue/retry" && context.Request.HttpMethod == "POST")
+        {
+            RetryQueueRequest? retryRequest = await JsonSerializer.DeserializeAsync<RetryQueueRequest>(context.Request.InputStream, AppJson.Options);
+
+            List<QueuedTransferItem> itemsToRetry;
+            lock (AppJson.QueueFileLock)
+            {
+                List<QueuedTransferItem> queue = LoadQueue();
+                itemsToRetry = retryRequest?.Ids is { Length: > 0 }
+                    ? queue.Where(x => retryRequest.Ids.Contains(x.Id)).ToList()
+                    : queue.ToList();
+            }
+
+            List<QueuedTransferItem> stillFailed = [];
+            List<string> retriedPaths = [];
+
+            foreach (QueuedTransferItem item in itemsToRetry)
+            {
+                try
+                {
+                    using AfcSession taskSession = AfcSession.Connect(udid);
+
+                    if (item.Operation == "delete")
+                    {
+                        DeleteRemotePathRecursive(taskSession.AfcClient, item.RemoteFilePath);
+                    }
+                    else
+                    {
+                        if (string.IsNullOrEmpty(item.DestinationDirectory))
+                            throw new InvalidOperationException("Destination directory is not set for this queued item.");
+
+                        string localPath = item.LocalPath ?? BuildLocalOutputPath(item.DestinationDirectory, item.RemoteFilePath);
+                        byte[] sourceHash = CopyRemoteFileToLocalAndComputeHash(taskSession.AfcClient, item.RemoteFilePath, localPath);
+
+                        if (item.Operation == "move")
+                        {
+                            byte[] localHash = ComputeLocalFileHash(localPath);
+                            if (!CryptographicOperations.FixedTimeEquals(sourceHash, localHash))
+                                throw new InvalidOperationException("SHA-256 mismatch. Remote source file was not deleted.");
+                            ThrowIfError(NativeMethods.afc_remove_path(taskSession.AfcClient, item.RemoteFilePath), $"Unable to delete remote file '{item.RemoteFilePath}'");
+                        }
+
+                        retriedPaths.Add(localPath);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    stillFailed.Add(item with { ErrorMessage = ex.Message, QueuedAt = DateTimeOffset.UtcNow });
+                }
+            }
+
+            lock (AppJson.QueueFileLock)
+            {
+                List<QueuedTransferItem> queue = LoadQueue();
+                HashSet<string> retriedIds = new(itemsToRetry.Select(x => x.Id), StringComparer.Ordinal);
+                queue.RemoveAll(x => retriedIds.Contains(x.Id));
+                queue.AddRange(stillFailed);
+                SaveQueue(queue);
+            }
+
+            await WriteJsonResponseAsync(context.Response, new TransferResponse(
+                $"Retried {itemsToRetry.Count} item(s). {stillFailed.Count} still failed.",
+                retriedPaths.ToArray(),
+                stillFailed.Select(x => new FailedTransferItem(x.RemoteFilePath, x.LocalPath, x.ErrorMessage)).ToArray()
+            ));
             return;
         }
 
@@ -522,6 +688,73 @@ static void WriteUsage()
     Console.WriteLine("  AppleFileConduitDemo [list|--list] <remoteDirectoryPath> [deviceUdid]");
     Console.WriteLine("  AppleFileConduitDemo [copy|--copy] <remoteFilePath> <localOutputPath> [deviceUdid]");
     Console.WriteLine("  AppleFileConduitDemo [move|--move] <remoteFilePath> <localOutputPath> [deviceUdid]");
+}
+
+static List<QueuedTransferItem> LoadQueue()
+{
+    try
+    {
+        if (File.Exists(AppJson.QueueFilePath))
+        {
+            string json = File.ReadAllText(AppJson.QueueFilePath);
+            return JsonSerializer.Deserialize<List<QueuedTransferItem>>(json, AppJson.Options) ?? [];
+        }
+    }
+    catch { }
+    return [];
+}
+
+static void SaveQueue(List<QueuedTransferItem> queue)
+{
+    try
+    {
+        File.WriteAllText(AppJson.QueueFilePath, JsonSerializer.Serialize(queue, AppJson.Options));
+    }
+    catch { }
+}
+
+static void AddToQueue(IEnumerable<QueuedTransferItem> items)
+{
+    List<QueuedTransferItem> toAdd = items.ToList();
+    if (toAdd.Count == 0) return;
+    lock (AppJson.QueueFileLock)
+    {
+        List<QueuedTransferItem> queue = LoadQueue();
+        queue.AddRange(toAdd);
+        SaveQueue(queue);
+    }
+}
+
+static async Task<(List<(string RemoteFilePath, string LocalPath, byte[] SourceHash)> Successes, List<FailedTransferItem> Failures)> ExecuteParallelCopiesAsync(
+    string? udid,
+    IEnumerable<(string RemoteFilePath, string LocalDestPath)> filesToCopy,
+    int parallelism)
+{
+    List<(string RemoteFilePath, string LocalPath, byte[] SourceHash)> successes = [];
+    List<FailedTransferItem> failures = [];
+    object resultLock = new();
+    int maxDegree = Math.Max(1, Math.Min(16, parallelism));
+
+    await Parallel.ForEachAsync(
+        filesToCopy,
+        new ParallelOptions { MaxDegreeOfParallelism = maxDegree },
+        (item, _) =>
+        {
+            try
+            {
+                using AfcSession taskSession = AfcSession.Connect(udid);
+                byte[] hash = CopyRemoteFileToLocalAndComputeHash(taskSession.AfcClient, item.RemoteFilePath, item.LocalDestPath);
+                lock (resultLock) { successes.Add((item.RemoteFilePath, item.LocalDestPath, hash)); }
+            }
+            catch (Exception ex)
+            {
+                lock (resultLock) { failures.Add(new FailedTransferItem(item.RemoteFilePath, item.LocalDestPath, ex.Message)); }
+            }
+            return ValueTask.CompletedTask;
+        }
+    );
+
+    return (successes, failures);
 }
 
 static void ListRemoteDirectory(IntPtr afcClient, string remotePath)
@@ -1303,17 +1536,31 @@ internal sealed record MediaAssetView(
 
 internal sealed record MediaLibraryResponse(MediaAssetView[] Items, int PhotoCount, int LivePhotoCount, int VideoCount, string[] ScannedRoots);
 
-internal sealed record TransferRequest(string[] AssetIds, string DestinationDirectory, string Operation, bool IncludeAdditionalRoots);
+internal sealed record TransferRequest(string[] AssetIds, string DestinationDirectory, string Operation, bool IncludeAdditionalRoots, int Parallelism = 4);
 
-internal sealed record TransferResponse(string Message, string[] LocalPaths);
+internal sealed record TransferResponse(string Message, string[] LocalPaths, FailedTransferItem[] FailedItems);
 
-internal sealed record FsTransferRequest(string[] SelectedPaths, string? DestinationDirectory, string Operation);
+internal sealed record FsTransferRequest(string[] SelectedPaths, string? DestinationDirectory, string Operation, int Parallelism = 4);
 
 internal sealed record RemoteFsEntry(string Name, string Path, bool IsDirectory, bool IsFile, long? SizeBytes);
 
 internal sealed record RemoteFsListingResponse(string CurrentPath, string? ParentPath, RemoteFsEntry[] Entries);
 
 internal sealed record ErrorResponse(string Message);
+
+internal sealed record FailedTransferItem(string RemoteFilePath, string? LocalPath, string ErrorMessage);
+
+internal sealed record QueuedTransferItem(
+    string Id,
+    string RemoteFilePath,
+    string? LocalPath,
+    string Operation,
+    string? DestinationDirectory,
+    string ErrorMessage,
+    DateTimeOffset QueuedAt
+);
+
+internal sealed record RetryQueueRequest(string[]? Ids);
 
 internal static class NativeError
 {
@@ -1329,6 +1576,8 @@ internal static class NativeError
 internal static class AppJson
 {
     public static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web);
+    public static readonly string QueueFilePath = Path.Combine(AppContext.BaseDirectory, "failed-transfers.json");
+    public static readonly object QueueFileLock = new();
 }
 
 internal static class UiPage
@@ -1655,6 +1904,105 @@ internal static class UiPage
       .toolbar { grid-template-columns: 1fr; }
       .fs-row { grid-template-columns: 1fr; }
     }
+    .settings-btn {
+      background: none;
+      border: 0;
+      font-size: 1.4rem;
+      padding: 6px 8px;
+      border-radius: 10px;
+      cursor: pointer;
+      color: var(--muted);
+      transition: color .15s ease, background .15s ease;
+    }
+    .settings-btn:hover { color: var(--text); background: var(--border); transform: none; }
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.4);
+      z-index: 200;
+      align-items: center;
+      justify-content: center;
+    }
+    .modal-overlay.active { display: flex; }
+    .modal {
+      background: var(--panel);
+      border-radius: 20px;
+      box-shadow: var(--shadow);
+      padding: 24px;
+      min-width: 320px;
+      max-width: 460px;
+      width: 90%;
+      display: grid;
+      gap: 16px;
+    }
+    .modal-title {
+      margin: 0;
+      font-size: 1.2rem;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .modal-footer { display: flex; gap: 10px; justify-content: flex-end; }
+    .setting-row {
+      display: grid;
+      gap: 6px;
+    }
+    .setting-label {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+    }
+    .setting-label strong { font-weight: 600; }
+    .setting-label .setting-value {
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: var(--accent);
+    }
+    .setting-hint { color: var(--muted); font-size: .85rem; }
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+    .queue-panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      box-shadow: var(--shadow);
+      margin-top: 18px;
+      overflow: hidden;
+    }
+    .queue-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .queue-header h3 { margin: 0; font-size: 1rem; }
+    .queue-header-actions { display: flex; gap: 8px; }
+    .queue-item {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 10px;
+      align-items: center;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .queue-item:last-child { border-bottom: 0; }
+    .queue-item-info { min-width: 0; }
+    .queue-item-info .qi-path { color: var(--muted); font-size: .85rem; word-break: break-all; }
+    .queue-item-info .qi-error { color: #b63838; font-size: .85rem; margin-top: 2px; }
+    .queue-item-info .qi-meta { color: var(--muted); font-size: .8rem; margin-top: 2px; }
+    .queue-item-btns { display: flex; gap: 6px; align-items: center; }
+    .queue-item-btns button { padding: 8px 10px; border-radius: 8px; white-space: nowrap; }
+    @media (max-width: 640px) {
+      .queue-item { grid-template-columns: 1fr; }
+      .queue-item-btns { justify-content: flex-end; }
+    }
   </style>
 </head>
 <body>
@@ -1664,6 +2012,7 @@ internal static class UiPage
         <h1>Apple File Conduit</h1>
         <div class="subtitle">Browse media or the remote file system from the connected iPhone and copy, move, or delete selected items.</div>
       </div>
+      <button class="settings-btn" id="settingsButton" title="Settings" aria-label="Settings">⚙</button>
     </div>
 
     <div class="toolbar">
@@ -1708,9 +2057,49 @@ internal static class UiPage
       <div class="summary" id="fsSummary"></div>
       <div class="fs-list" id="fsList"></div>
     </div>
+
+    <div id="queuePanel" class="queue-panel hidden">
+      <div class="queue-header">
+        <h3 id="queueTitle">⚠ Failed Transfers</h3>
+        <div class="queue-header-actions">
+          <button id="retryAllButton">↺ Retry All</button>
+          <button class="danger" id="clearQueueButton">✕ Clear All</button>
+        </div>
+      </div>
+      <div id="queueList"></div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="settingsOverlay" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="modal">
+      <h2 class="modal-title" id="settingsTitle">⚙ Settings</h2>
+      <div class="setting-row">
+        <div class="setting-label">
+          <strong>Parallel transfers</strong>
+          <span class="setting-value" id="parallelismValue">4</span>
+        </div>
+        <div class="setting-hint">Number of files to copy, move, or delete simultaneously (1–16).</div>
+        <input type="range" id="parallelismInput" min="1" max="16" value="4" aria-label="Parallel transfers">
+      </div>
+      <div class="modal-footer">
+        <button class="primary" id="settingsCloseButton">Done</button>
+      </div>
+    </div>
   </div>
 
   <script>
+    const settingsStorageKey = 'afc-settings';
+
+    function loadSettings() {
+      try { return JSON.parse(localStorage.getItem(settingsStorageKey) || '{}'); } catch { return {}; }
+    }
+
+    function saveSettings() {
+      localStorage.setItem(settingsStorageKey, JSON.stringify(settings));
+    }
+
+    const settings = Object.assign({ parallelism: 4 }, loadSettings());
+
     const state = {
       items: [],
       selected: new Set(),
@@ -1745,6 +2134,16 @@ internal static class UiPage
     const fsPathInput = document.getElementById('fsPath');
     const fsOpenButton = document.getElementById('fsOpenButton');
     const fsUpButton = document.getElementById('fsUpButton');
+    const settingsButton = document.getElementById('settingsButton');
+    const settingsOverlay = document.getElementById('settingsOverlay');
+    const settingsCloseButton = document.getElementById('settingsCloseButton');
+    const parallelismInput = document.getElementById('parallelismInput');
+    const parallelismValue = document.getElementById('parallelismValue');
+    const queuePanel = document.getElementById('queuePanel');
+    const queueList = document.getElementById('queueList');
+    const queueTitle = document.getElementById('queueTitle');
+    const retryAllButton = document.getElementById('retryAllButton');
+    const clearQueueButton = document.getElementById('clearQueueButton');
 
     filterInput.addEventListener('change', () => {
       state.filter = filterInput.value;
@@ -1767,6 +2166,22 @@ internal static class UiPage
       }
     });
 
+    settingsButton.addEventListener('click', () => openSettings());
+    settingsOverlay.addEventListener('click', event => {
+      if (event.target === settingsOverlay) closeSettings();
+    });
+    settingsCloseButton.addEventListener('click', () => closeSettings());
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && settingsOverlay.classList.contains('active')) closeSettings();
+    });
+    parallelismInput.addEventListener('input', () => {
+      settings.parallelism = parseInt(parallelismInput.value);
+      parallelismValue.textContent = settings.parallelism;
+      saveSettings();
+    });
+    retryAllButton.addEventListener('click', () => retryQueueItems(null));
+    clearQueueButton.addEventListener('click', () => clearQueue());
+
     function setBusy(value) {
       state.busy = value;
       copyButton.disabled = value;
@@ -1788,6 +2203,109 @@ internal static class UiPage
     function setStatus(message, isError = false) {
       status.textContent = message;
       status.classList.toggle('error', isError);
+    }
+
+    function openSettings() {
+      parallelismInput.value = settings.parallelism;
+      parallelismValue.textContent = settings.parallelism;
+      settingsOverlay.classList.add('active');
+      settingsCloseButton.focus();
+    }
+
+    function closeSettings() {
+      settingsOverlay.classList.remove('active');
+    }
+
+    async function loadQueue() {
+      try {
+        const response = await fetch('/api/queue');
+        if (!response.ok) return;
+        const items = await response.json();
+        renderQueue(items);
+      } catch { }
+    }
+
+    function renderQueue(items) {
+      if (!items || items.length === 0) {
+        queuePanel.classList.add('hidden');
+        return;
+      }
+
+      queuePanel.classList.remove('hidden');
+      queueTitle.textContent = `⚠ Failed Transfers (${items.length})`;
+      queueList.innerHTML = '';
+
+      for (const item of items) {
+        const row = document.createElement('div');
+        row.className = 'queue-item';
+
+        const info = document.createElement('div');
+        info.className = 'queue-item-info';
+        const dateStr = item.queuedAt ? new Date(item.queuedAt).toLocaleString() : '';
+        info.innerHTML = `
+          <div><strong>${escapeHtml(item.remoteFilePath)}</strong></div>
+          ${item.localPath ? `<div class="qi-path">→ ${escapeHtml(item.localPath)}</div>` : ''}
+          <div class="qi-error">${escapeHtml(item.errorMessage)}</div>
+          <div class="qi-meta">${escapeHtml(dateStr)}${item.operation ? ` · ${escapeHtml(item.operation)}` : ''}</div>
+        `;
+
+        const btns = document.createElement('div');
+        btns.className = 'queue-item-btns';
+
+        const retryBtn = document.createElement('button');
+        retryBtn.textContent = '↺ Retry';
+        retryBtn.addEventListener('click', () => retryQueueItems([item.id]));
+
+        const removeBtn = document.createElement('button');
+        removeBtn.className = 'danger';
+        removeBtn.textContent = '✕';
+        removeBtn.title = 'Remove from queue';
+        removeBtn.addEventListener('click', () => removeQueueItem(item.id));
+
+        btns.appendChild(retryBtn);
+        btns.appendChild(removeBtn);
+        row.appendChild(info);
+        row.appendChild(btns);
+        queueList.appendChild(row);
+      }
+    }
+
+    async function retryQueueItems(ids) {
+      setBusy(true);
+      setStatus('Retrying failed transfers…');
+      try {
+        const response = await fetch('/api/queue/retry', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids: ids ?? null })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message || 'Retry failed.');
+        const note = data.failedItems && data.failedItems.length > 0
+          ? ` (${data.failedItems.length} still failed)`
+          : '';
+        setStatus(data.message + note, data.failedItems && data.failedItems.length > 0);
+        await loadQueue();
+      } catch (error) {
+        setStatus(error.message, true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function removeQueueItem(id) {
+      try {
+        await fetch(`/api/queue?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+        await loadQueue();
+      } catch { }
+    }
+
+    async function clearQueue() {
+      if (!window.confirm('Clear all failed transfer items from the queue?')) return;
+      try {
+        await fetch('/api/queue', { method: 'DELETE' });
+        await loadQueue();
+      } catch { }
     }
 
     function setViewMode(mode) {
@@ -2116,7 +2634,8 @@ internal static class UiPage
             assetIds: Array.from(state.selected),
             destinationDirectory,
             operation,
-            includeAdditionalRoots: includeAdditionalRootsInput.checked
+            includeAdditionalRoots: includeAdditionalRootsInput.checked,
+            parallelism: settings.parallelism
           })
         });
 
@@ -2125,7 +2644,10 @@ internal static class UiPage
           throw new Error(data.message || 'Transfer failed.');
         }
 
-        setStatus(`${data.message} ${data.localPaths.length} file(s) written.`);
+        const failCount = data.failedItems ? data.failedItems.length : 0;
+        const note = failCount > 0 ? ` ⚠ ${failCount} file(s) failed — see queue below.` : '';
+        setStatus(`${data.message} ${data.localPaths.length} file(s) written.${note}`, failCount > 0);
+        await loadQueue();
         await loadMedia();
       } catch (error) {
         setStatus(error.message, true);
@@ -2165,7 +2687,8 @@ internal static class UiPage
           body: JSON.stringify({
             selectedPaths: Array.from(state.fsSelected),
             destinationDirectory: operation === 'delete' ? null : destinationDirectory,
-            operation
+            operation,
+            parallelism: settings.parallelism
           })
         });
 
@@ -2174,8 +2697,11 @@ internal static class UiPage
           throw new Error(data.message || 'File system transfer failed.');
         }
 
+        const failCount = data.failedItems ? data.failedItems.length : 0;
         const countNote = operation === 'delete' ? '' : ` ${data.localPaths.length} file(s) written.`;
-        setStatus(`${data.message}${countNote}`);
+        const failNote = failCount > 0 ? ` ⚠ ${failCount} item(s) failed — see queue below.` : '';
+        setStatus(`${data.message}${countNote}${failNote}`, failCount > 0);
+        await loadQueue();
         await loadFs(state.fsCurrentPath);
       } catch (error) {
         setStatus(error.message, true);
@@ -2220,6 +2746,9 @@ internal static class UiPage
     renderFsSummary();
     renderFsList();
     setViewMode('media');
+    parallelismInput.value = settings.parallelism;
+    parallelismValue.textContent = settings.parallelism;
+    loadQueue();
   </script>
 </body>
 </html>
