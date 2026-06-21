@@ -263,26 +263,34 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                     throw new InvalidOperationException("One of the selected media items is no longer available on the device.");
                 }
 
+                List<(string RemotePath, string LocalPath, byte[] SourceHash)> transferredFiles = [];
+
                 foreach (string remotePath in asset.RemotePaths)
                 {
                     string localPath = BuildLocalOutputPath(request.DestinationDirectory, remotePath);
                     byte[] sourceHash = CopyRemoteFileToLocalAndComputeHash(session.AfcClient, remotePath, localPath);
+                    transferredFiles.Add((remotePath, localPath, sourceHash));
+                    copiedPaths.Add(localPath);
+                }
 
-                    if (deleteAfterCopy)
+                if (deleteAfterCopy)
+                {
+                    foreach ((string remotePath, string localPath, byte[] sourceHash) in transferredFiles)
                     {
                         byte[] localHash = ComputeLocalFileHash(localPath);
 
                         if (!CryptographicOperations.FixedTimeEquals(sourceHash, localHash))
                         {
                             throw new InvalidOperationException(
-                                $"SHA-256 mismatch for '{remotePath}' and '{localPath}'. Remote source file was not deleted."
+                                $"SHA-256 mismatch for '{remotePath}' and '{localPath}'. Remote source files were not deleted."
                             );
                         }
-
-                        ThrowIfError(NativeMethods.afc_remove_path(session.AfcClient, remotePath), $"Unable to delete remote file '{remotePath}'");
                     }
 
-                    copiedPaths.Add(localPath);
+                    foreach ((string remotePath, _, _) in transferredFiles)
+                    {
+                        ThrowIfError(NativeMethods.afc_remove_path(session.AfcClient, remotePath), $"Unable to delete remote file '{remotePath}'");
+                    }
                 }
             }
 
@@ -435,7 +443,9 @@ static IReadOnlyList<MediaAsset> EnumerateMediaAssets(IntPtr afcClient)
     List<RemoteFileEntry> images = files.Where(x => IsImageFile(x.Path)).OrderByDescending(x => x.Path, StringComparer.OrdinalIgnoreCase).ToList();
     List<RemoteFileEntry> videos = files.Where(x => IsVideoFile(x.Path)).OrderByDescending(x => x.Path, StringComparer.OrdinalIgnoreCase).ToList();
 
-    Dictionary<string, RemoteFileEntry> videosByStem = videos.ToDictionary(GetStemKey, StringComparer.OrdinalIgnoreCase);
+    Dictionary<string, RemoteFileEntry> videosByStem = videos
+        .GroupBy(GetStemKey, StringComparer.OrdinalIgnoreCase)
+        .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
     HashSet<string> pairedVideos = new(StringComparer.OrdinalIgnoreCase);
     List<MediaAsset> assets = [];
 
@@ -712,7 +722,15 @@ static void TryOpenBrowser(string url)
 
         if (OperatingSystem.IsLinux())
         {
-            Process.Start("xdg-open", url);
+            Process.Start(
+                new ProcessStartInfo("xdg-open", url)
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }
+            );
         }
     }
     catch
@@ -792,10 +810,7 @@ static string DecodeAssetId(string id)
 
 static void ThrowIfError(int errorCode, string message)
 {
-    if (errorCode != 0)
-    {
-        throw new InvalidOperationException($"{message}. Native error code: {errorCode}");
-    }
+    NativeError.ThrowIfError(errorCode, message);
 }
 
 internal sealed class AfcSession : IDisposable
@@ -822,16 +837,16 @@ internal sealed class AfcSession : IDisposable
 
         try
         {
-            ThrowIfError(NativeMethods.idevice_new(ref device, udid), "Unable to connect to iOS device");
-            ThrowIfError(
+            NativeError.ThrowIfError(NativeMethods.idevice_new(ref device, udid), "Unable to connect to iOS device");
+            NativeError.ThrowIfError(
                 NativeMethods.lockdownd_client_new_with_handshake(device, ref lockdowndClient, "AppleFileConduitDemo"),
                 "Unable to start lockdownd session"
             );
-            ThrowIfError(
+            NativeError.ThrowIfError(
                 NativeMethods.lockdownd_start_service(lockdowndClient, "com.apple.afc", ref serviceDescriptor),
                 "Unable to start AFC service (is the device trusted and unlocked?)"
             );
-            ThrowIfError(NativeMethods.afc_client_new(device, serviceDescriptor, ref afcClient), "Unable to create AFC client");
+            NativeError.ThrowIfError(NativeMethods.afc_client_new(device, serviceDescriptor, ref afcClient), "Unable to create AFC client");
             return new AfcSession(device, lockdowndClient, serviceDescriptor, afcClient);
         }
         catch
@@ -942,6 +957,17 @@ internal sealed record TransferRequest(string[] AssetIds, string DestinationDire
 internal sealed record TransferResponse(string Message, string[] LocalPaths);
 
 internal sealed record ErrorResponse(string Message);
+
+internal static class NativeError
+{
+    public static void ThrowIfError(int errorCode, string message)
+    {
+        if (errorCode != 0)
+        {
+            throw new InvalidOperationException($"{message}. Native error code: {errorCode}");
+        }
+    }
+}
 
 internal static class AppJson
 {
