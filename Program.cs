@@ -1809,13 +1809,14 @@ internal static class UiPage
       backdrop-filter: blur(10px);
     }
     .badge {
-      top: 12px;
-      left: 12px;
-      padding: 7px 10px;
-      background: rgba(20, 30, 58, 0.72);
+      top: 10px;
+      left: 10px;
+      width: 30px;
+      height: 30px;
+      display: grid;
+      place-items: center;
+      background: rgba(0, 0, 0, 0.40);
       color: white;
-      font-size: .8rem;
-      font-weight: 600;
     }
     .selector {
       top: 12px;
@@ -1836,7 +1837,10 @@ internal static class UiPage
     .duration {
       right: 12px;
       bottom: 72px;
-      padding: 6px 10px;
+      padding: 4px 8px;
+      display: flex;
+      align-items: center;
+      gap: 4px;
       background: rgba(20, 30, 58, 0.75);
       color: white;
       font-size: .82rem;
@@ -2600,8 +2604,10 @@ internal static class UiPage
           }
         });
 
-        const badgeText = item.kind === 'live-photo' ? 'Live' : item.kind === 'video' ? 'Video' : 'Photo';
-        const durationMarkup = item.kind === 'video' ? '<div class="duration">Video</div>' : '';
+        const livePhotoIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20"><circle cx="12" cy="12" r="2.5" fill="white"/><circle cx="12" cy="12" r="7" fill="none" stroke="white" stroke-width="1.5"/><circle cx="12" cy="12" r="11" fill="none" stroke="white" stroke-width="1.5"/></svg>`;
+        const timerIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round"><circle cx="7" cy="7" r="6"/><polyline points="7 3.5 7 7 9.5 8.5"/></svg>`;
+        const badgeMarkup = item.kind === 'live-photo' ? `<div class="badge">${livePhotoIcon}</div>` : '';
+        const durationMarkup = item.kind === 'video' ? `<div class="duration">${timerIcon}<span class="dur-text">0:00</span></div>` : '';
         const selectorText = selected ? '&#10003;' : '';
         const preview = item.previewMode === 'video'
           ? `<div class="video-preview"><video preload="auto" muted playsinline src="${item.previewUrl}"></video><div class="fallback-icon">▶</div></div>`
@@ -2611,7 +2617,7 @@ internal static class UiPage
 
         card.innerHTML = `
           ${preview}
-          <div class="badge">${badgeText}</div>
+          ${badgeMarkup}
           <div class="selector">${selectorText}</div>
           ${durationMarkup}
           <div class="card-footer">
@@ -2627,7 +2633,7 @@ internal static class UiPage
 
           video.addEventListener('loadedmetadata', () => {
             if (Number.isFinite(video.duration)) {
-              duration.textContent = formatDuration(video.duration);
+              duration.querySelector('.dur-text').textContent = formatDuration(video.duration);
             }
           });
 
@@ -2637,7 +2643,7 @@ internal static class UiPage
 
           video.addEventListener('error', () => {
             fallback.style.display = 'grid';
-            duration.textContent = 'Video';
+            duration.querySelector('.dur-text').textContent = '0:00';
           });
         }
 
