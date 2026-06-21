@@ -150,11 +150,7 @@ static async Task<int> RunUiAsync(string? udid)
     _ = MediaIndexStore.TriggerRefreshAsync(
         udid,
         includeAdditionalRoots: false,
-        () =>
-        {
-            using AfcSession session = AfcSession.Connect(udid);
-            return EnumerateMediaAssets(session.AfcClient, includeAdditionalRoots: false, udid);
-        }
+        () => EnumerateMediaAssetsHybrid(includeAdditionalRoots: false, udid)
     );
     TryOpenBrowser(prefix);
     Console.WriteLine($"Media browser UI available at {prefix}");
@@ -213,11 +209,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             MediaEnumerationResult media = await MediaIndexStore.GetOrBuildAsync(
                 udid,
                 includeAdditionalRoots,
-                () =>
-                {
-                    using AfcSession session = AfcSession.Connect(udid);
-                    return EnumerateMediaAssets(session.AfcClient, includeAdditionalRoots, udid);
-                }
+                () => EnumerateMediaAssetsHybrid(includeAdditionalRoots, udid)
             );
             IReadOnlyList<MediaAsset> assets = media.Assets;
 
@@ -226,7 +218,8 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                 assets.Count(x => x.Kind == MediaKind.Photo),
                 assets.Count(x => x.Kind == MediaKind.LivePhoto),
                 assets.Count(x => x.Kind == MediaKind.Video),
-                media.ScannedRoots
+                media.ScannedRoots,
+                media.Backend
             );
 
             await WriteJsonResponseAsync(context.Response, payload);
@@ -536,15 +529,12 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             IReadOnlyList<MediaAsset> assets = (await MediaIndexStore.GetOrBuildAsync(
                 udid,
                 request.IncludeAdditionalRoots,
-                () =>
-                {
-                    using AfcSession refreshSession = AfcSession.Connect(udid);
-                    return EnumerateMediaAssets(refreshSession.AfcClient, request.IncludeAdditionalRoots, udid);
-                }
+                () => EnumerateMediaAssetsHybrid(request.IncludeAdditionalRoots, udid)
             )).Assets;
             Dictionary<string, MediaAsset> assetsById = assets.ToDictionary(x => x.Id, StringComparer.Ordinal);
 
             List<TransferCopyWorkItem> filesToCopy = [];
+            List<MediaAsset> selectedAssets = [];
             foreach (string assetId in request.AssetIds.Distinct(StringComparer.Ordinal))
             {
                 if (!assetsById.TryGetValue(assetId, out MediaAsset? asset))
@@ -553,6 +543,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                     await WriteJsonResponseAsync(context.Response, new ErrorResponse("One of the selected media items is no longer available on the device."));
                     return;
                 }
+                selectedAssets.Add(asset);
 
                 foreach (string remotePath in asset.RemotePaths)
                 {
@@ -577,6 +568,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             if (deleteAfterCopy && successes.Count > 0)
             {
                 HashSet<string> failedRemotePaths = new(StringComparer.Ordinal);
+                HashSet<string> verifiedRemotePaths = new(StringComparer.Ordinal);
                 foreach ((string itemId, string remotePath, string localPath, byte[] sourceHash) in successes)
                 {
                     try
@@ -587,7 +579,10 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                             failures.Add(new FailedTransferItem(remotePath, localPath, "SHA-256 mismatch. Remote source file was not deleted."));
                             failedRemotePaths.Add(remotePath);
                             progressTracker.MarkFailed(itemId, "SHA-256 mismatch. Remote source file was not deleted.");
+                            continue;
                         }
+
+                        verifiedRemotePaths.Add(remotePath);
                     }
                     catch (Exception ex)
                     {
@@ -597,25 +592,41 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                     }
                 }
 
-                foreach ((string itemId, string remotePath, _, _) in successes)
+                using PtpSession? ptpSession = selectedAssets.Any(x => x.PtpObjectHandlesByPath.Count > 0) ? PtpSession.TryConnect(udid) : null;
+                foreach (MediaAsset asset in selectedAssets)
                 {
-                    if (failedRemotePaths.Contains(remotePath)) continue;
+                    if (asset.RemotePaths.Any(path => !verifiedRemotePaths.Contains(path)))
+                    {
+                        continue;
+                    }
+
                     try
                     {
-                        ThrowIfError(NativeMethods.afc_remove_path(session.AfcClient, remotePath), $"Unable to delete remote file '{remotePath}'");
-                        AfcMetadataCache.InvalidatePath(udid, remotePath);
+                        DeleteMediaAssetSources(asset, session.AfcClient, ptpSession, udid);
+                        foreach (string remotePath in asset.RemotePaths)
+                        {
+                            AfcMetadataCache.InvalidatePath(udid, remotePath);
+                        }
                     }
                     catch (Exception ex)
                     {
-                        failures.Add(new FailedTransferItem(remotePath, null, $"Delete after copy failed: {ex.Message}"));
-                        progressTracker.MarkFailed(itemId, $"Delete after copy failed: {ex.Message}");
+                        foreach (string remotePath in asset.RemotePaths)
+                        {
+                            failures.Add(new FailedTransferItem(remotePath, null, $"Delete after copy failed: {ex.Message}"));
+                        }
+
+                        foreach (string path in asset.RemotePaths)
+                        {
+                            failedRemotePaths.Add(path);
+                        }
                     }
                 }
                 MediaIndexStore.MarkDirty(udid);
             }
             progressTracker.MarkCompleted();
 
-            AddToQueue(failures.Select(f => new QueuedTransferItem(
+            IEnumerable<FailedTransferItem> queueableFailures = failures.Where(f => !(deleteAfterCopy && f.LocalPath is null));
+            AddToQueue(queueableFailures.Select(f => new QueuedTransferItem(
                 Guid.NewGuid().ToString(), f.RemoteFilePath, f.LocalPath, request.Operation, request.DestinationDirectory, f.ErrorMessage, DateTimeOffset.UtcNow
             )));
 
@@ -938,7 +949,49 @@ static void ListRemoteDirectory(IntPtr afcClient, string remotePath)
     }
 }
 
-static MediaEnumerationResult EnumerateMediaAssets(IntPtr afcClient, bool includeAdditionalRoots, string? udid = null)
+static MediaEnumerationResult EnumerateMediaAssetsHybrid(bool includeAdditionalRoots, string? udid = null)
+{
+    try
+    {
+        using PtpSession ptpSession = PtpSession.Connect(udid);
+        List<PtpMediaObject> ptpObjects = EnumerateMediaObjectsViaPtp(ptpSession);
+        MediaEnumerationResult ptpResult = BuildMediaEnumerationResult(
+            ptpObjects.Select(x => new RemoteFileEntry(x.RemotePath)).ToList(),
+            scannedRoots: ["DCIM"],
+            backend: "ptp",
+            ptpHandlesByPath: ptpObjects.ToDictionary(x => x.RemotePath, x => x.ObjectHandle, StringComparer.OrdinalIgnoreCase)
+        );
+
+        if (!includeAdditionalRoots)
+        {
+            return ptpResult;
+        }
+
+        try
+        {
+            using AfcSession afcSession = AfcSession.Connect(udid);
+            MediaEnumerationResult afcWithAdditionalRoots = EnumerateMediaAssetsViaAfc(afcSession.AfcClient, includeAdditionalRoots: true, udid);
+            List<MediaAsset> mergedAssets = ptpResult.Assets
+                .Concat(afcWithAdditionalRoots.Assets.Where(
+                    candidate => ptpResult.Assets.All(existing => !string.Equals(existing.PrimaryRemotePath, candidate.PrimaryRemotePath, StringComparison.OrdinalIgnoreCase))
+                ))
+                .ToList();
+            return new MediaEnumerationResult(mergedAssets, afcWithAdditionalRoots.ScannedRoots, "hybrid");
+        }
+        catch
+        {
+            return ptpResult;
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"PTP media enumeration failed, falling back to AFC. {ex.Message}");
+        using AfcSession afcSession = AfcSession.Connect(udid);
+        return EnumerateMediaAssetsViaAfc(afcSession.AfcClient, includeAdditionalRoots, udid);
+    }
+}
+
+static MediaEnumerationResult EnumerateMediaAssetsViaAfc(IntPtr afcClient, bool includeAdditionalRoots, string? udid = null)
 {
     List<RemoteFileEntry> files = [];
     List<string> scannedRoots = [];
@@ -951,13 +1004,6 @@ static MediaEnumerationResult EnumerateMediaAssets(IntPtr afcClient, bool includ
 
     foreach (string root in rootsToScan)
     {
-        if (string.Equals(root, "DCIM", StringComparison.OrdinalIgnoreCase))
-        {
-            EnumerateRemoteFiles(afcClient, root, files, udid);
-            scannedRoots.Add(root);
-            continue;
-        }
-
         try
         {
             EnumerateRemoteFiles(afcClient, root, files, udid);
@@ -968,9 +1014,17 @@ static MediaEnumerationResult EnumerateMediaAssets(IntPtr afcClient, bool includ
         }
     }
 
-    files = files
-        .DistinctBy(x => x.Path, StringComparer.OrdinalIgnoreCase)
-        .ToList();
+    return BuildMediaEnumerationResult(files, scannedRoots.ToArray(), "afc");
+}
+
+static MediaEnumerationResult BuildMediaEnumerationResult(
+    List<RemoteFileEntry> files,
+    string[] scannedRoots,
+    string backend,
+    Dictionary<string, uint>? ptpHandlesByPath = null
+)
+{
+    files = files.DistinctBy(x => x.Path, StringComparer.OrdinalIgnoreCase).ToList();
 
     List<RemoteFileEntry> images = files.Where(x => IsImageFile(x.Path)).OrderByDescending(x => x.Path, StringComparer.OrdinalIgnoreCase).ToList();
     List<RemoteFileEntry> videos = files.Where(x => IsVideoFile(x.Path)).OrderByDescending(x => x.Path, StringComparer.OrdinalIgnoreCase).ToList();
@@ -994,7 +1048,9 @@ static MediaEnumerationResult EnumerateMediaAssets(IntPtr afcClient, bool includ
                     Path.GetFileNameWithoutExtension(image.Path),
                     MediaKind.LivePhoto,
                     image.Path,
-                    new[] { image.Path, pairedVideo.Path }
+                    new[] { image.Path, pairedVideo.Path },
+                    BuildPtpHandleMap(new[] { image.Path, pairedVideo.Path }, ptpHandlesByPath),
+                    backend
                 )
             );
             continue;
@@ -1006,7 +1062,9 @@ static MediaEnumerationResult EnumerateMediaAssets(IntPtr afcClient, bool includ
                 Path.GetFileNameWithoutExtension(image.Path),
                 MediaKind.Photo,
                 image.Path,
-                new[] { image.Path }
+                new[] { image.Path },
+                BuildPtpHandleMap(new[] { image.Path }, ptpHandlesByPath),
+                backend
             )
         );
     }
@@ -1024,15 +1082,144 @@ static MediaEnumerationResult EnumerateMediaAssets(IntPtr afcClient, bool includ
                 Path.GetFileNameWithoutExtension(video.Path),
                 MediaKind.Video,
                 video.Path,
-                new[] { video.Path }
+                new[] { video.Path },
+                BuildPtpHandleMap(new[] { video.Path }, ptpHandlesByPath),
+                backend
             )
         );
     }
 
     return new MediaEnumerationResult(
         assets.OrderByDescending(x => x.PrimaryRemotePath, StringComparer.OrdinalIgnoreCase).ToArray(),
-        scannedRoots.ToArray()
+        scannedRoots,
+        backend
     );
+}
+
+static IReadOnlyDictionary<string, uint> BuildPtpHandleMap(IEnumerable<string> remotePaths, Dictionary<string, uint>? ptpHandlesByPath)
+{
+    if (ptpHandlesByPath is null)
+    {
+        return new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    Dictionary<string, uint> result = new(StringComparer.OrdinalIgnoreCase);
+    foreach (string remotePath in remotePaths)
+    {
+        if (ptpHandlesByPath.TryGetValue(remotePath, out uint handle))
+        {
+        result[remotePath] = handle;
+        }
+    }
+
+    return result;
+}
+
+static List<PtpMediaObject> EnumerateMediaObjectsViaPtp(PtpSession session)
+{
+    List<PtpMediaObject> mediaObjects = [];
+    session.OpenSession();
+    uint[] storageIds = session.GetStorageIds();
+    foreach (uint storageId in storageIds)
+    {
+        uint[] handles = session.GetObjectHandles(storageId);
+        Dictionary<uint, PtpObjectInfo> infos = new(handles.Length);
+        foreach (uint handle in handles)
+        {
+            infos[handle] = session.GetObjectInfo(handle);
+        }
+
+        foreach ((uint handle, PtpObjectInfo info) in infos)
+        {
+            if (info.IsAssociation || string.IsNullOrWhiteSpace(info.FileName))
+            {
+                continue;
+            }
+
+            string path = BuildPtpRemotePath(infos, handle);
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                continue;
+            }
+
+            mediaObjects.Add(new PtpMediaObject(handle, path));
+        }
+    }
+
+    return mediaObjects
+        .Where(x => x.RemotePath.StartsWith("DCIM/", StringComparison.OrdinalIgnoreCase))
+        .DistinctBy(x => x.RemotePath, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+}
+
+static string BuildPtpRemotePath(IReadOnlyDictionary<uint, PtpObjectInfo> infos, uint handle)
+{
+    if (!infos.TryGetValue(handle, out PtpObjectInfo? current))
+    {
+        return string.Empty;
+    }
+
+    List<string> segments = [];
+    if (!string.IsNullOrWhiteSpace(current.FileName))
+    {
+        segments.Add(current.FileName);
+    }
+
+    uint parent = current.ParentObject;
+    int guard = 0;
+    while (parent != 0 && parent != 0xFFFFFFFF && guard++ < 1024)
+    {
+        if (!infos.TryGetValue(parent, out PtpObjectInfo? parentInfo))
+        {
+            break;
+        }
+
+        if (!string.IsNullOrWhiteSpace(parentInfo.FileName))
+        {
+            segments.Add(parentInfo.FileName);
+        }
+
+        parent = parentInfo.ParentObject;
+    }
+
+    segments.Reverse();
+    if (segments.Count == 0)
+    {
+        return string.Empty;
+    }
+
+    if (!string.Equals(segments[0], "DCIM", StringComparison.OrdinalIgnoreCase))
+    {
+        segments.Insert(0, "DCIM");
+    }
+
+    return string.Join("/", segments.Select(x => x.Trim('/')));
+}
+
+static void DeleteMediaAssetSources(MediaAsset asset, IntPtr afcClient, PtpSession? ptpSession, string? udid = null)
+{
+    HashSet<uint> ptpHandles = asset.PtpObjectHandlesByPath.Values.ToHashSet();
+    if (ptpHandles.Count > 0)
+    {
+        if (ptpSession is null)
+        {
+            throw new InvalidOperationException("PTP delete requested but PTP session is unavailable.");
+        }
+
+        ptpSession.OpenSession();
+        foreach (uint handle in ptpHandles)
+        {
+            ptpSession.DeleteObject(handle);
+        }
+
+        return;
+    }
+
+    foreach (string remotePath in asset.RemotePaths.Distinct(StringComparer.OrdinalIgnoreCase))
+    {
+        ThrowIfError(NativeMethods.afc_remove_path(afcClient, remotePath), $"Unable to delete remote file '{remotePath}'");
+        AfcMetadataCache.InvalidatePath(udid, remotePath);
+    }
 }
 
 static void EnumerateRemoteFiles(IntPtr afcClient, string remoteDirectoryPath, List<RemoteFileEntry> files, string? udid = null)
@@ -1559,6 +1746,421 @@ static void ThrowIfError(int errorCode, string message)
     NativeError.ThrowIfError(errorCode, message);
 }
 
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+internal struct LockdownServiceDescriptorRaw
+{
+    public ushort Port;
+    public byte SslEnabled;
+}
+
+internal sealed class PtpSession : IDisposable
+{
+    private const ushort PtpContainerTypeCommand = 1;
+    private const ushort PtpContainerTypeData = 2;
+    private const ushort PtpContainerTypeResponse = 3;
+
+    private const ushort PtpOperationOpenSession = 0x1002;
+    private const ushort PtpOperationGetStorageIds = 0x1004;
+    private const ushort PtpOperationGetObjectHandles = 0x1007;
+    private const ushort PtpOperationGetObjectInfo = 0x1008;
+    private const ushort PtpOperationDeleteObject = 0x100B;
+
+    private const ushort PtpResponseOk = 0x2001;
+
+    private IntPtr _connection;
+    private uint _nextTransactionId = 1;
+    private bool _sessionOpened;
+
+    private PtpSession(IntPtr device, IntPtr lockdowndClient, IntPtr serviceDescriptor, IntPtr connection)
+    {
+        Device = device;
+        LockdowndClient = lockdowndClient;
+        ServiceDescriptor = serviceDescriptor;
+        _connection = connection;
+    }
+
+    public IntPtr Device { get; }
+    public IntPtr LockdowndClient { get; }
+    public IntPtr ServiceDescriptor { get; }
+
+    public static PtpSession Connect(string? udid)
+    {
+        IntPtr device = IntPtr.Zero;
+        IntPtr lockdowndClient = IntPtr.Zero;
+        IntPtr serviceDescriptor = IntPtr.Zero;
+        IntPtr connection = IntPtr.Zero;
+
+        try
+        {
+            NativeError.ThrowIfError(NativeMethods.idevice_new(ref device, udid), "Unable to connect to iOS device");
+            NativeError.ThrowIfError(
+                NativeMethods.lockdownd_client_new_with_handshake(device, ref lockdowndClient, "AppleFileConduitDemo"),
+                "Unable to start lockdownd session"
+            );
+            NativeError.ThrowIfError(
+                NativeMethods.lockdownd_start_service(lockdowndClient, "com.apple.ptp", ref serviceDescriptor),
+                "Unable to start PTP service"
+            );
+            if (serviceDescriptor == IntPtr.Zero)
+            {
+                throw new InvalidOperationException("PTP service descriptor was empty.");
+            }
+
+            LockdownServiceDescriptorRaw descriptor = Marshal.PtrToStructure<LockdownServiceDescriptorRaw>(serviceDescriptor);
+            if (descriptor.Port == 0)
+            {
+                throw new InvalidOperationException("PTP service returned an invalid port.");
+            }
+
+            NativeError.ThrowIfError(NativeMethods.idevice_connect(device, descriptor.Port, ref connection), "Unable to connect to PTP service");
+            if (descriptor.SslEnabled != 0)
+            {
+                NativeError.ThrowIfError(NativeMethods.idevice_connection_enable_ssl(connection), "Unable to enable PTP SSL");
+            }
+
+            return new PtpSession(device, lockdowndClient, serviceDescriptor, connection);
+        }
+        catch
+        {
+            if (connection != IntPtr.Zero)
+            {
+                NativeMethods.idevice_disconnect(connection);
+            }
+
+            if (serviceDescriptor != IntPtr.Zero)
+            {
+                NativeMethods.lockdownd_service_descriptor_free(serviceDescriptor);
+            }
+
+            if (lockdowndClient != IntPtr.Zero)
+            {
+                NativeMethods.lockdownd_client_free(lockdowndClient);
+            }
+
+            if (device != IntPtr.Zero)
+            {
+                NativeMethods.idevice_free(device);
+            }
+
+            throw;
+        }
+    }
+
+    public static PtpSession? TryConnect(string? udid)
+    {
+        try
+        {
+            return Connect(udid);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public void OpenSession()
+    {
+        if (_sessionOpened)
+        {
+            return;
+        }
+
+        (_, ushort response, _) = ExecuteOperation(PtpOperationOpenSession, 1);
+        if (response != PtpResponseOk)
+        {
+            throw new InvalidOperationException($"PTP OpenSession failed with response 0x{response:X4}.");
+        }
+
+        _sessionOpened = true;
+    }
+
+    public uint[] GetStorageIds()
+    {
+        byte[] payload = ExecuteDataOperation(PtpOperationGetStorageIds);
+        return ReadPtpUInt32Array(payload);
+    }
+
+    public uint[] GetObjectHandles(uint storageId)
+    {
+        byte[] payload = ExecuteDataOperation(PtpOperationGetObjectHandles, storageId, 0, 0xFFFFFFFF);
+        return ReadPtpUInt32Array(payload);
+    }
+
+    public PtpObjectInfo GetObjectInfo(uint handle)
+    {
+        byte[] payload = ExecuteDataOperation(PtpOperationGetObjectInfo, handle);
+        return ParseObjectInfo(payload);
+    }
+
+    public void DeleteObject(uint handle)
+    {
+        (_, ushort response, _) = ExecuteOperation(PtpOperationDeleteObject, handle, 0);
+        if (response != PtpResponseOk)
+        {
+            throw new InvalidOperationException($"PTP DeleteObject({handle}) failed with response 0x{response:X4}.");
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_connection != IntPtr.Zero)
+        {
+            NativeMethods.idevice_connection_disable_ssl(_connection);
+            NativeMethods.idevice_disconnect(_connection);
+            _connection = IntPtr.Zero;
+        }
+
+        if (ServiceDescriptor != IntPtr.Zero)
+        {
+            NativeMethods.lockdownd_service_descriptor_free(ServiceDescriptor);
+        }
+
+        if (LockdowndClient != IntPtr.Zero)
+        {
+            NativeMethods.lockdownd_client_free(LockdowndClient);
+        }
+
+        if (Device != IntPtr.Zero)
+        {
+            NativeMethods.idevice_free(Device);
+        }
+    }
+
+    private byte[] ExecuteDataOperation(ushort operationCode, params uint[] parameters)
+    {
+        (byte[]? payload, ushort response, _) = ExecuteOperation(operationCode, parameters);
+        if (response != PtpResponseOk)
+        {
+            throw new InvalidOperationException($"PTP op 0x{operationCode:X4} failed with response 0x{response:X4}.");
+        }
+
+        return payload ?? Array.Empty<byte>();
+    }
+
+    private (byte[]? Payload, ushort ResponseCode, uint[] ResponseParameters) ExecuteOperation(ushort operationCode, params uint[] parameters)
+    {
+        uint transactionId = _nextTransactionId++;
+        SendContainer(PtpContainerTypeCommand, operationCode, transactionId, parameters, payload: null);
+
+        PtpContainer first = ReadContainer();
+        if (first.Type == PtpContainerTypeResponse)
+        {
+            return (null, first.Code, first.Parameters);
+        }
+
+        if (first.Type != PtpContainerTypeData)
+        {
+            throw new InvalidOperationException($"Unexpected PTP container type {first.Type}.");
+        }
+
+        PtpContainer response = ReadContainer();
+        if (response.Type != PtpContainerTypeResponse)
+        {
+            throw new InvalidOperationException("PTP response container was missing.");
+        }
+
+        return (first.Payload, response.Code, response.Parameters);
+    }
+
+    private void SendContainer(ushort type, ushort code, uint transactionId, uint[]? parameters, byte[]? payload)
+    {
+        int parameterCount = parameters?.Length ?? 0;
+        int payloadLength = payload?.Length ?? 0;
+        int totalLength = 12 + (parameterCount * 4) + payloadLength;
+        byte[] buffer = new byte[totalLength];
+
+        WriteUInt32(buffer, 0, (uint)totalLength);
+        WriteUInt16(buffer, 4, type);
+        WriteUInt16(buffer, 6, code);
+        WriteUInt32(buffer, 8, transactionId);
+
+        int offset = 12;
+        if (parameters is not null)
+        {
+            foreach (uint parameter in parameters)
+            {
+                WriteUInt32(buffer, offset, parameter);
+                offset += 4;
+            }
+        }
+
+        if (payloadLength > 0)
+        {
+            Buffer.BlockCopy(payload!, 0, buffer, offset, payloadLength);
+        }
+
+        SendBytes(buffer);
+    }
+
+    private void SendBytes(byte[] data)
+    {
+        int offset = 0;
+        while (offset < data.Length)
+        {
+            byte[] chunk = offset == 0 ? data : data[offset..];
+            uint sent = 0;
+            NativeError.ThrowIfError(NativeMethods.idevice_connection_send(_connection, chunk, (uint)chunk.Length, ref sent), "Unable to send PTP data");
+            if (sent == 0)
+            {
+                throw new IOException("PTP send returned zero bytes.");
+            }
+
+            offset += (int)sent;
+        }
+    }
+
+    private PtpContainer ReadContainer()
+    {
+        byte[] lengthBytes = ReceiveExact(4);
+        uint length = ReadUInt32(lengthBytes, 0);
+        if (length < 12)
+        {
+            throw new InvalidOperationException($"Invalid PTP container length: {length}.");
+        }
+
+        byte[] remainder = ReceiveExact((int)length - 4);
+        ushort type = ReadUInt16(remainder, 0);
+        ushort code = ReadUInt16(remainder, 2);
+        uint transactionId = ReadUInt32(remainder, 4);
+        byte[] body = remainder[8..];
+
+        if (type == PtpContainerTypeResponse)
+        {
+            uint[] responseParameters = ReadPtpUInt32ArrayWithKnownCount(body, body.Length / 4);
+            return new PtpContainer(type, code, transactionId, responseParameters, Array.Empty<byte>());
+        }
+
+        return new PtpContainer(type, code, transactionId, Array.Empty<uint>(), body);
+    }
+
+    private byte[] ReceiveExact(int length)
+    {
+        byte[] buffer = new byte[length];
+        int offset = 0;
+        while (offset < length)
+        {
+            byte[] target = offset == 0 ? buffer : new byte[length - offset];
+            uint received = 0;
+            NativeError.ThrowIfError(
+                NativeMethods.idevice_connection_receive(_connection, target, (uint)target.Length, ref received),
+                "Unable to read PTP data"
+            );
+            if (received == 0)
+            {
+                throw new IOException("PTP receive returned zero bytes.");
+            }
+
+            if (offset == 0)
+            {
+                offset += (int)received;
+                continue;
+            }
+
+            Buffer.BlockCopy(target, 0, buffer, offset, (int)received);
+            offset += (int)received;
+        }
+
+        return buffer;
+    }
+
+    private static uint[] ReadPtpUInt32Array(byte[] payload)
+    {
+        if (payload.Length < 4)
+        {
+            return [];
+        }
+
+        int count = (int)ReadUInt32(payload, 0);
+        if (count <= 0)
+        {
+            return [];
+        }
+
+        return ReadPtpUInt32ArrayWithKnownCount(payload[4..], count);
+    }
+
+    private static uint[] ReadPtpUInt32ArrayWithKnownCount(byte[] payload, int count)
+    {
+        if (count <= 0)
+        {
+            return [];
+        }
+
+        uint[] values = new uint[count];
+        for (int i = 0; i < count; i++)
+        {
+            int offset = i * 4;
+            if (offset + 4 > payload.Length)
+            {
+                break;
+            }
+
+            values[i] = ReadUInt32(payload, offset);
+        }
+
+        return values;
+    }
+
+    private static PtpObjectInfo ParseObjectInfo(byte[] payload)
+    {
+        if (payload.Length < 52)
+        {
+            throw new InvalidOperationException("PTP object info payload was incomplete.");
+        }
+
+        ushort objectFormat = ReadUInt16(payload, 4);
+        uint parentObject = ReadUInt32(payload, 40);
+        int offset = 52;
+        string fileName = ReadPtpString(payload, ref offset);
+        return new PtpObjectInfo(fileName, objectFormat == 0x3001, parentObject);
+    }
+
+    private static string ReadPtpString(byte[] payload, ref int offset)
+    {
+        if (offset >= payload.Length)
+        {
+            return string.Empty;
+        }
+
+        int count = payload[offset++];
+        if (count <= 0)
+        {
+            return string.Empty;
+        }
+
+        int byteLength = count * 2;
+        if (offset + byteLength > payload.Length)
+        {
+            byteLength = Math.Max(0, payload.Length - offset);
+        }
+
+        string value = Encoding.Unicode.GetString(payload, offset, byteLength);
+        offset += byteLength;
+        return value.TrimEnd('\0');
+    }
+
+    private static void WriteUInt16(byte[] buffer, int offset, ushort value)
+    {
+        buffer[offset] = (byte)(value & 0xFF);
+        buffer[offset + 1] = (byte)((value >> 8) & 0xFF);
+    }
+
+    private static void WriteUInt32(byte[] buffer, int offset, uint value)
+    {
+        buffer[offset] = (byte)(value & 0xFF);
+        buffer[offset + 1] = (byte)((value >> 8) & 0xFF);
+        buffer[offset + 2] = (byte)((value >> 16) & 0xFF);
+        buffer[offset + 3] = (byte)((value >> 24) & 0xFF);
+    }
+
+    private static ushort ReadUInt16(byte[] buffer, int offset) => (ushort)(buffer[offset] | (buffer[offset + 1] << 8));
+
+    private static uint ReadUInt32(byte[] buffer, int offset) =>
+        (uint)(buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16) | (buffer[offset + 3] << 24));
+
+    private readonly record struct PtpContainer(ushort Type, ushort Code, uint TransactionId, uint[] Parameters, byte[] Payload);
+}
+
 internal sealed class AfcSession : IDisposable
 {
     private AfcSession(IntPtr device, IntPtr lockdowndClient, IntPtr serviceDescriptor, IntPtr afcClient)
@@ -1654,7 +2256,9 @@ internal sealed record MediaAsset(
     string Name,
     MediaKind Kind,
     string PrimaryRemotePath,
-    IReadOnlyList<string> RemotePaths
+    IReadOnlyList<string> RemotePaths,
+    IReadOnlyDictionary<string, uint> PtpObjectHandlesByPath,
+    string SourceBackend
 );
 
 internal enum MediaKind
@@ -1664,7 +2268,11 @@ internal enum MediaKind
     Video
 }
 
-internal sealed record MediaEnumerationResult(IReadOnlyList<MediaAsset> Assets, string[] ScannedRoots);
+internal sealed record MediaEnumerationResult(IReadOnlyList<MediaAsset> Assets, string[] ScannedRoots, string Backend);
+
+internal sealed record PtpMediaObject(uint ObjectHandle, string RemotePath);
+
+internal sealed record PtpObjectInfo(string FileName, bool IsAssociation, uint ParentObject);
 
 internal sealed record MediaAssetView(
     string Id,
@@ -1701,7 +2309,7 @@ internal sealed record MediaAssetView(
     }
 }
 
-internal sealed record MediaLibraryResponse(MediaAssetView[] Items, int PhotoCount, int LivePhotoCount, int VideoCount, string[] ScannedRoots);
+internal sealed record MediaLibraryResponse(MediaAssetView[] Items, int PhotoCount, int LivePhotoCount, int VideoCount, string[] ScannedRoots, string Backend);
 
 internal sealed record TransferRequest(string[] AssetIds, string DestinationDirectory, string Operation, bool IncludeAdditionalRoots, int Parallelism = 4, string? OperationId = null);
 
@@ -3743,6 +4351,34 @@ internal static class NativeMethods
 
     [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
     public static extern int idevice_free(IntPtr device);
+
+    [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int idevice_connect(IntPtr device, ushort port, ref IntPtr connection);
+
+    [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int idevice_disconnect(IntPtr connection);
+
+    [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int idevice_connection_enable_ssl(IntPtr connection);
+
+    [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int idevice_connection_disable_ssl(IntPtr connection);
+
+    [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int idevice_connection_send(
+        IntPtr connection,
+        [In] byte[] data,
+        uint len,
+        ref uint sentBytes
+    );
+
+    [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int idevice_connection_receive(
+        IntPtr connection,
+        [Out] byte[] data,
+        uint len,
+        ref uint receivedBytes
+    );
 
     [DllImport("imobiledevice-1.0", CallingConvention = CallingConvention.Cdecl)]
     public static extern int lockdownd_client_new_with_handshake(

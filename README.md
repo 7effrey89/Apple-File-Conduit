@@ -2,6 +2,12 @@
 
 Minimal C# app that can either run AFC copy/list/move commands directly or launch a local browser UI for browsing photos, live photos, and videos from an iPhone via the open-source `libimobiledevice` stack.
 
+The UI media pipeline uses a hybrid transport model:
+
+- **PTP** for media enumeration/metadata and media delete operations (Photos-safe object deletion)
+- **AFC** for file copy/move bytes and filesystem browsing operations
+- **AFC fallback** for media enumeration if PTP is unavailable
+
 ## Prerequisites
 
 Install .NET 8 SDK (required for `dotnet run`):
@@ -55,7 +61,7 @@ The UI starts a local web server, opens a browser, and provides two views:
 
 - Enable **Include PhotoData** in the toolbar to also scan the optional `PhotoData` media tree when it is available through AFC.
 - The browser UI recognizes additional image formats including `.dng`, `.tif`, and `.tiff`. Formats that the browser cannot preview directly are still listed and can be copied or moved.
-- Media scans are cached and refreshed in the background so repeated loads avoid full AFC rescans.
+- Media scans are cached and refreshed in the background so repeated loads avoid full rescans (PTP first, AFC fallback).
 - File system listings fetch metadata in parallel across multiple AFC sessions for faster large-folder browsing.
 
 ### List example
