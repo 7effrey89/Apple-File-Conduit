@@ -1319,8 +1319,8 @@ internal static class UiPage
         <option value="live-photo">Live Photos</option>
         <option value="video">Videos</option>
       </select>
-      <label class="toggle">
-        <input type="checkbox" id="includeAdditionalRoots">
+      <label class="toggle" title="Any iCloud-downloaded originals that live in /var/mobile/Media/PhotoData/">
+        <input type="checkbox" id="includeAdditionalRoots" title="Any iCloud-downloaded originals that live in /var/mobile/Media/PhotoData/">
         <span>Include PhotoData</span>
       </label>
       <button class="primary" id="copyButton">Copy Selected</button>
