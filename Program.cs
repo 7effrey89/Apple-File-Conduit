@@ -954,6 +954,7 @@ static MediaEnumerationResult EnumerateMediaAssetsHybrid(bool includeAdditionalR
 {
     if (MediaIndexStore.PtpFallbackState.ShouldBypassPtp(udid))
     {
+        LogPtpFallbackDiagnostics(cachedBypass: true);
         using AfcSession afcSession = AfcSession.Connect(udid);
         return EnumerateMediaAssetsViaAfc(afcSession.AfcClient, includeAdditionalRoots, udid) with
         {
@@ -1002,7 +1003,7 @@ static MediaEnumerationResult EnumerateMediaAssetsHybrid(bool includeAdditionalR
         }
 
         string backendNote = BuildPtpFallbackNote(ex);
-        Console.WriteLine(BuildPtpFallbackLogMessage(ex));
+        LogPtpFallbackDiagnostics(ex);
         using AfcSession afcSession = AfcSession.Connect(udid);
         return EnumerateMediaAssetsViaAfc(afcSession.AfcClient, includeAdditionalRoots, udid) with
         {
@@ -1029,6 +1030,30 @@ static string BuildPtpFallbackLogMessage(Exception ex)
     }
 
     return $"PTP media enumeration failed, falling back to AFC. {ex.Message}";
+}
+
+static void LogPtpFallbackDiagnostics(Exception? ex = null, bool cachedBypass = false)
+{
+    Console.WriteLine(cachedBypass
+        ? "PTP service is still in a short retry cooldown for this device; using AFC fallback without another PTP probe."
+        : BuildPtpFallbackLogMessage(ex!));
+    Console.WriteLine("Scan note: if your scan still shows files, this fallback is informational and not a fatal error.");
+    if (ex is not null)
+    {
+        Console.WriteLine($"PTP detail: {ex.Message}");
+        if (TryGetNativeErrorCode(ex, out int errorCode))
+        {
+            Console.WriteLine($"PTP native error code: {errorCode}");
+        }
+    }
+
+    Console.WriteLine("Common causes:");
+    Console.WriteLine(" - iPhone is not fully unlocked.");
+    Console.WriteLine(" - This computer has not been fully trusted by the device.");
+    Console.WriteLine(" - The USB connection or cable is unstable.");
+    Console.WriteLine(" - usbmuxd or libimobiledevice is not healthy on this machine.");
+    Console.WriteLine(" - This iPhone/iOS session is not offering the PTP service right now.");
+    Console.WriteLine("Expected behavior: the app tries PTP first and falls back to AFC when PTP is unavailable.");
 }
 
 static string BuildPtpUnavailableNote() => "PTP is not available on this device, so media was loaded through AFC instead.";
