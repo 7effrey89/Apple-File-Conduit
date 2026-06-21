@@ -952,7 +952,7 @@ static void ListRemoteDirectory(IntPtr afcClient, string remotePath)
 
 static MediaEnumerationResult EnumerateMediaAssetsHybrid(bool includeAdditionalRoots, string? udid = null)
 {
-    if (PtpFallbackState.ShouldBypassPtp(udid))
+    if (MediaIndexStore.PtpFallbackState.ShouldBypassPtp(udid))
     {
         using AfcSession afcSession = AfcSession.Connect(udid);
         return EnumerateMediaAssetsViaAfc(afcSession.AfcClient, includeAdditionalRoots, udid) with
@@ -964,7 +964,7 @@ static MediaEnumerationResult EnumerateMediaAssetsHybrid(bool includeAdditionalR
     try
     {
         using PtpSession ptpSession = PtpSession.Connect(udid);
-        PtpFallbackState.Clear(udid);
+        MediaIndexStore.PtpFallbackState.Clear(udid);
         List<PtpMediaObject> ptpObjects = EnumerateMediaObjectsViaPtp(ptpSession);
         MediaEnumerationResult ptpResult = BuildMediaEnumerationResult(
             ptpObjects.Select(x => new RemoteFileEntry(x.RemotePath)).ToList(),
@@ -998,7 +998,7 @@ static MediaEnumerationResult EnumerateMediaAssetsHybrid(bool includeAdditionalR
     {
         if (IsPtpServiceUnavailable(ex))
         {
-            PtpFallbackState.MarkPtpUnavailable(udid);
+            MediaIndexStore.PtpFallbackState.MarkPtpUnavailable(udid);
         }
 
         string backendNote = BuildPtpFallbackNote(ex);
