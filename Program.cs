@@ -219,7 +219,8 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                 assets.Count(x => x.Kind == MediaKind.LivePhoto),
                 assets.Count(x => x.Kind == MediaKind.Video),
                 media.ScannedRoots,
-                media.Backend
+                media.Backend,
+                media.BackendNote
             );
 
             await WriteJsonResponseAsync(context.Response, payload);
@@ -985,10 +986,34 @@ static MediaEnumerationResult EnumerateMediaAssetsHybrid(bool includeAdditionalR
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"PTP media enumeration failed, falling back to AFC. {ex.Message}");
+        string backendNote = BuildPtpFallbackNote(ex);
+        Console.WriteLine(BuildPtpFallbackLogMessage(ex));
         using AfcSession afcSession = AfcSession.Connect(udid);
-        return EnumerateMediaAssetsViaAfc(afcSession.AfcClient, includeAdditionalRoots, udid);
+        return EnumerateMediaAssetsViaAfc(afcSession.AfcClient, includeAdditionalRoots, udid) with
+        {
+            BackendNote = backendNote
+        };
     }
+}
+
+static string BuildPtpFallbackNote(Exception ex)
+{
+    if (TryGetNativeErrorCode(ex, out int errorCode) && errorCode == -27)
+    {
+        return "PTP is not available on this device, so media was loaded through AFC instead.";
+    }
+
+    return "PTP media enumeration was unavailable, so media was loaded through AFC instead.";
+}
+
+static string BuildPtpFallbackLogMessage(Exception ex)
+{
+    if (TryGetNativeErrorCode(ex, out int errorCode) && errorCode == -27)
+    {
+        return "PTP service is unavailable on this device; using AFC fallback for media enumeration.";
+    }
+
+    return $"PTP media enumeration failed, falling back to AFC. {ex.Message}";
 }
 
 static MediaEnumerationResult EnumerateMediaAssetsViaAfc(IntPtr afcClient, bool includeAdditionalRoots, string? udid = null)
@@ -2268,7 +2293,7 @@ internal enum MediaKind
     Video
 }
 
-internal sealed record MediaEnumerationResult(IReadOnlyList<MediaAsset> Assets, string[] ScannedRoots, string Backend);
+internal sealed record MediaEnumerationResult(IReadOnlyList<MediaAsset> Assets, string[] ScannedRoots, string Backend, string? BackendNote = null);
 
 internal sealed record PtpMediaObject(uint ObjectHandle, string RemotePath);
 
@@ -2309,7 +2334,7 @@ internal sealed record MediaAssetView(
     }
 }
 
-internal sealed record MediaLibraryResponse(MediaAssetView[] Items, int PhotoCount, int LivePhotoCount, int VideoCount, string[] ScannedRoots, string Backend);
+internal sealed record MediaLibraryResponse(MediaAssetView[] Items, int PhotoCount, int LivePhotoCount, int VideoCount, string[] ScannedRoots, string Backend, string? BackendNote);
 
 internal sealed record TransferRequest(string[] AssetIds, string DestinationDirectory, string Operation, bool IncludeAdditionalRoots, int Parallelism = 4, string? OperationId = null);
 
@@ -2738,6 +2763,24 @@ internal static class NativeError
             throw new InvalidOperationException($"{message}. Native error code: {errorCode}");
         }
     }
+}
+
+static bool TryGetNativeErrorCode(Exception ex, out int errorCode)
+{
+    const string marker = "Native error code:";
+    string message = ex.Message;
+    int markerIndex = message.LastIndexOf(marker, StringComparison.Ordinal);
+    if (markerIndex >= 0)
+    {
+        string codeText = message[(markerIndex + marker.Length)..].Trim();
+        if (int.TryParse(codeText, out errorCode))
+        {
+            return true;
+        }
+    }
+
+    errorCode = 0;
+    return false;
 }
 
 internal static class AppJson
@@ -3716,6 +3759,12 @@ internal static class UiPage
       return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     }
 
+    function buildMediaLoadStatus(data) {
+      const scannedRoots = formatRootList(data.scannedRoots);
+      const backendNote = data.backendNote ? ` ${data.backendNote}` : '';
+      return `Loaded ${state.items.length} items from ${scannedRoots}.${backendNote}`;
+    }
+
     function statusTextForProgressItem(item) {
       if (item.status === 'failed') return item.errorMessage || 'Failed';
       if (item.status === 'succeeded') return 'Done';
@@ -4213,7 +4262,7 @@ internal static class UiPage
         state.selected.clear();
         renderSummary();
         renderGrid();
-        setStatus(`Loaded ${state.items.length} items from ${formatRootList(data.scannedRoots)}.`);
+        setStatus(buildMediaLoadStatus(data));
       } catch (error) {
         state.items = [];
         state.selected.clear();
