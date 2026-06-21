@@ -1122,6 +1122,9 @@ internal static class UiPage
       margin: 0;
       accent-color: var(--accent);
     }
+    .toggle input[type="checkbox"]:disabled {
+      opacity: .55;
+    }
     button {
       border: 0;
       border-radius: 12px;
