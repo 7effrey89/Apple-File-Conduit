@@ -774,21 +774,11 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                 }
                 selectedAssets.Add(asset);
 
-                DateTimeOffset? captureDateTime = null;
-                if (string.Equals(request.PhotoNaming, "datetime", StringComparison.OrdinalIgnoreCase))
-                {
-                  try
-                  {
-                    captureDateTime = GetRemoteEntryInfo(session.AfcClient, asset.PrimaryRemotePath, udid).CaptureDateTime;
-                  }
-                  catch
-                  {
-                    captureDateTime = null;
-                  }
-                }
-
                 foreach (string remotePath in asset.RemotePaths)
                 {
+                  DateTimeOffset? captureDateTime = string.Equals(request.PhotoNaming, "datetime", StringComparison.OrdinalIgnoreCase)
+                    ? ResolveCaptureDateTimeForNaming(session.AfcClient, remotePath, asset.PrimaryRemotePath, udid)
+                    : null;
                   string outputName = BuildOutputFileName(remotePath, request.PhotoNaming, captureDateTime);
                   string localPath = BuildLocalOutputPath(request.DestinationDirectory, remotePath, outputName);
                     filesToCopy.Add(new TransferCopyWorkItem(
@@ -1993,13 +1983,22 @@ static DateTimeOffset? TryReadAfcTimestamp(IReadOnlyDictionary<string, string> v
     return null;
   }
 
-  if (!long.TryParse(rawValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out long timestamp))
+  string normalized = rawValue.Trim();
+  if (!double.TryParse(normalized, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsed))
   {
     return null;
   }
 
+  long timestamp = (long)Math.Round(parsed);
+
   try
   {
+    // AFC timestamps may be seconds, milliseconds, microseconds, or nanoseconds.
+    while (timestamp > 10_000_000_000_000L)
+    {
+      timestamp /= 1000;
+    }
+
     if (timestamp > 10_000_000_000L)
     {
       return DateTimeOffset.FromUnixTimeMilliseconds(timestamp);
@@ -2016,6 +2015,30 @@ static DateTimeOffset? TryReadAfcTimestamp(IReadOnlyDictionary<string, string> v
   }
 
   return null;
+}
+
+static DateTimeOffset ResolveCaptureDateTimeForNaming(IntPtr afcClient, string remotePath, string primaryRemotePath, string? udid = null)
+{
+  DateTimeOffset? captureDateTime = TryGetCaptureDateTime(afcClient, remotePath, udid);
+  if (captureDateTime is null && !string.Equals(remotePath, primaryRemotePath, StringComparison.OrdinalIgnoreCase))
+  {
+    captureDateTime = TryGetCaptureDateTime(afcClient, primaryRemotePath, udid);
+  }
+
+  // Keep datetime naming predictable even if device metadata is missing.
+  return captureDateTime ?? DateTimeOffset.Now;
+}
+
+static DateTimeOffset? TryGetCaptureDateTime(IntPtr afcClient, string remotePath, string? udid = null)
+{
+  try
+  {
+    return GetRemoteEntryInfo(afcClient, remotePath, udid).CaptureDateTime;
+  }
+  catch
+  {
+    return null;
+  }
 }
 
 static string NormalizeRemotePath(string remotePath)
@@ -5211,16 +5234,17 @@ internal static class UiPage
         const timerIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round"><circle cx="7" cy="7" r="6"/><polyline points="7 3.5 7 7 9.5 8.5"/></svg>`;
         const cachedVideo = item.previewMode === 'video' ? state.videoPreviewCache.get(item.id) : null;
         const progressItem = mediaProgressByPath.get(item.primaryRemotePath);
+        const completedTooltipAttr = progressItem?.status === 'succeeded' ? ' title="Completed"' : '';
         const badgeMarkup = item.kind === 'live-photo' ? `<div class="badge">${livePhotoIcon}</div>` : '';
         const durationMarkup = item.kind === 'video' ? `<div class="duration">${timerIcon}<span class="dur-text">${cachedVideo?.durationText || '--:--'}</span></div>` : '';
         const progressMarkup = buildMediaCopyProgressMarkup(progressItem);
         const selectorText = selected ? '&#10003;' : '';
         const preview = item.previewMode === 'video'
           ? cachedVideo?.posterDataUrl
-            ? `<img class="preview" loading="lazy" src="${cachedVideo.posterDataUrl}" alt="${escapeHtml(item.name)}">`
-            : `<div class="video-preview"><div class="video-loading"><div class="video-spinner"></div></div><div class="fallback-icon hidden">▶</div></div>`
+            ? `<img class="preview" loading="lazy" src="${cachedVideo.posterDataUrl}" alt="${escapeHtml(item.name)}"${completedTooltipAttr}>`
+            : `<div class="video-preview"${completedTooltipAttr}><div class="video-loading"><div class="video-spinner"></div></div><div class="fallback-icon hidden">▶</div></div>`
           : item.previewMode === 'image'
-            ? `<div class="thumb-shell image-thumb"><img class="preview" loading="lazy" src="${item.previewUrl}" alt="${escapeHtml(item.name)}"><div class="thumb-loading"><div class="video-spinner"></div></div></div>`
+            ? `<div class="thumb-shell image-thumb"${completedTooltipAttr}><img class="preview" loading="lazy" src="${item.previewUrl}" alt="${escapeHtml(item.name)}"><div class="thumb-loading"><div class="video-spinner"></div></div></div>`
             : buildImageFallbackMarkup(item);
 
         card.innerHTML = `
