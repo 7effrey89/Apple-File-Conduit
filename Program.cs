@@ -4412,11 +4412,17 @@ internal static class UiPage
         if (!response.ok) {
           throw new Error(data.message || 'Unable to reset cache.');
         }
-        if (state.viewMode === 'filesystem') {
-          await loadFs(state.fsCurrentPath || 'DCIM');
-        } else {
-          await loadMedia();
-        }
+        state.items = [];
+        state.selected.clear();
+        state.fsEntries = [];
+        state.fsSelected.clear();
+        renderGrid();
+        renderSummary();
+        renderFsList();
+        renderFsSummary();
+        state.ptpFallbackActive = false;
+        retryPtpButton.classList.add('hidden');
+        setStatus('Cache cleared. Click Scan Media to reload.');
       } catch (error) {
         setStatus(error.message, true);
       } finally {
