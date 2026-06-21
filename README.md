@@ -61,7 +61,7 @@ The UI starts a local web server, opens a browser, and provides two views:
 
 - Enable **Include PhotoData** in the toolbar to also scan the optional `PhotoData` media tree when it is available through AFC.
 - The browser UI recognizes additional image formats including `.dng`, `.tif`, and `.tiff`. Formats that the browser cannot preview directly are still listed and can be copied or moved.
-- Media scans are cached and refreshed in the background so repeated loads avoid full rescans (PTP first, AFC fallback).
+- Media scans are cached and refreshed in the background so repeated loads avoid full rescans (PTP first, AFC fallback, with a short retry cooldown when PTP is unavailable).
 - File system listings fetch metadata in parallel across multiple AFC sessions for faster large-folder browsing.
 
 ### List example

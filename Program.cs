@@ -952,9 +952,19 @@ static void ListRemoteDirectory(IntPtr afcClient, string remotePath)
 
 static MediaEnumerationResult EnumerateMediaAssetsHybrid(bool includeAdditionalRoots, string? udid = null)
 {
+    if (PtpFallbackState.ShouldBypassPtp(udid))
+    {
+        using AfcSession afcSession = AfcSession.Connect(udid);
+        return EnumerateMediaAssetsViaAfc(afcSession.AfcClient, includeAdditionalRoots, udid) with
+        {
+            BackendNote = BuildPtpUnavailableNote()
+        };
+    }
+
     try
     {
         using PtpSession ptpSession = PtpSession.Connect(udid);
+        PtpFallbackState.Clear(udid);
         List<PtpMediaObject> ptpObjects = EnumerateMediaObjectsViaPtp(ptpSession);
         MediaEnumerationResult ptpResult = BuildMediaEnumerationResult(
             ptpObjects.Select(x => new RemoteFileEntry(x.RemotePath)).ToList(),
@@ -986,6 +996,11 @@ static MediaEnumerationResult EnumerateMediaAssetsHybrid(bool includeAdditionalR
     }
     catch (Exception ex)
     {
+        if (IsPtpServiceUnavailable(ex))
+        {
+            PtpFallbackState.MarkPtpUnavailable(udid);
+        }
+
         string backendNote = BuildPtpFallbackNote(ex);
         Console.WriteLine(BuildPtpFallbackLogMessage(ex));
         using AfcSession afcSession = AfcSession.Connect(udid);
@@ -998,9 +1013,9 @@ static MediaEnumerationResult EnumerateMediaAssetsHybrid(bool includeAdditionalR
 
 static string BuildPtpFallbackNote(Exception ex)
 {
-    if (TryGetNativeErrorCode(ex, out int errorCode) && errorCode == -27)
+    if (IsPtpServiceUnavailable(ex))
     {
-        return "PTP is not available on this device, so media was loaded through AFC instead.";
+        return BuildPtpUnavailableNote();
     }
 
     return "PTP media enumeration was unavailable, so media was loaded through AFC instead.";
@@ -1008,13 +1023,17 @@ static string BuildPtpFallbackNote(Exception ex)
 
 static string BuildPtpFallbackLogMessage(Exception ex)
 {
-    if (TryGetNativeErrorCode(ex, out int errorCode) && errorCode == -27)
+    if (IsPtpServiceUnavailable(ex))
     {
         return "PTP service is unavailable on this device; using AFC fallback for media enumeration.";
     }
 
     return $"PTP media enumeration failed, falling back to AFC. {ex.Message}";
 }
+
+static string BuildPtpUnavailableNote() => "PTP is not available on this device, so media was loaded through AFC instead.";
+
+static bool IsPtpServiceUnavailable(Exception ex) => TryGetNativeErrorCode(ex, out int errorCode) && errorCode == -27;
 
 static MediaEnumerationResult EnumerateMediaAssetsViaAfc(IntPtr afcClient, bool includeAdditionalRoots, string? udid = null)
 {
@@ -2769,6 +2788,35 @@ internal static class MediaIndexStore
         public DateTimeOffset CreatedAtUtc { get; } = DateTimeOffset.UtcNow;
 
         public bool IsExpired(TimeSpan ttl) => DateTimeOffset.UtcNow - CreatedAtUtc > ttl;
+    }
+
+    internal static class PtpFallbackState
+    {
+        private static readonly ConcurrentDictionary<string, DateTimeOffset> PtpUnavailableUntil = new(StringComparer.Ordinal);
+        private static readonly TimeSpan RetryAfter = TimeSpan.FromMinutes(2);
+
+        public static bool ShouldBypassPtp(string? udid)
+        {
+            string deviceKey = GetDeviceKey(udid);
+            if (!PtpUnavailableUntil.TryGetValue(deviceKey, out DateTimeOffset unavailableUntil))
+            {
+                return false;
+            }
+
+            if (unavailableUntil <= DateTimeOffset.UtcNow)
+            {
+                PtpUnavailableUntil.TryRemove(deviceKey, out _);
+                return false;
+            }
+
+            return true;
+        }
+
+        public static void MarkPtpUnavailable(string? udid) => PtpUnavailableUntil[GetDeviceKey(udid)] = DateTimeOffset.UtcNow.Add(RetryAfter);
+
+        public static void Clear(string? udid) => PtpUnavailableUntil.TryRemove(GetDeviceKey(udid), out _);
+
+        private static string GetDeviceKey(string? udid) => string.IsNullOrWhiteSpace(udid) ? "default-device" : udid.Trim();
     }
 }
 
