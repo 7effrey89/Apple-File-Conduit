@@ -147,7 +147,15 @@ static async Task<int> RunUiAsync(string? udid)
 
     Console.CancelKeyPress += StopServer;
 
-    _ = MediaIndexStore.TriggerRefreshAsync(udid, includeAdditionalRoots: false);
+    _ = MediaIndexStore.TriggerRefreshAsync(
+        udid,
+        includeAdditionalRoots: false,
+        () =>
+        {
+            using AfcSession session = AfcSession.Connect(udid);
+            return EnumerateMediaAssets(session.AfcClient, includeAdditionalRoots: false, udid);
+        }
+    );
     TryOpenBrowser(prefix);
     Console.WriteLine($"Media browser UI available at {prefix}");
     Console.WriteLine("Press Ctrl+C to stop.");
@@ -202,7 +210,15 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
         if (path == "/api/media" && context.Request.HttpMethod == "GET")
         {
             bool includeAdditionalRoots = IsTruthy(context.Request.QueryString["includeAdditionalRoots"]);
-            MediaEnumerationResult media = await MediaIndexStore.GetOrBuildAsync(udid, includeAdditionalRoots);
+            MediaEnumerationResult media = await MediaIndexStore.GetOrBuildAsync(
+                udid,
+                includeAdditionalRoots,
+                () =>
+                {
+                    using AfcSession session = AfcSession.Connect(udid);
+                    return EnumerateMediaAssets(session.AfcClient, includeAdditionalRoots, udid);
+                }
+            );
             IReadOnlyList<MediaAsset> assets = media.Assets;
 
             MediaLibraryResponse payload = new(
@@ -517,7 +533,15 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             bool deleteAfterCopy = string.Equals(request.Operation, "move", StringComparison.OrdinalIgnoreCase);
 
             using AfcSession session = AfcSession.Connect(udid);
-            IReadOnlyList<MediaAsset> assets = (await MediaIndexStore.GetOrBuildAsync(udid, request.IncludeAdditionalRoots)).Assets;
+            IReadOnlyList<MediaAsset> assets = (await MediaIndexStore.GetOrBuildAsync(
+                udid,
+                request.IncludeAdditionalRoots,
+                () =>
+                {
+                    using AfcSession refreshSession = AfcSession.Connect(udid);
+                    return EnumerateMediaAssets(refreshSession.AfcClient, request.IncludeAdditionalRoots, udid);
+                }
+            )).Assets;
             Dictionary<string, MediaAsset> assetsById = assets.ToDictionary(x => x.Id, StringComparer.Ordinal);
 
             List<TransferCopyWorkItem> filesToCopy = [];
@@ -1931,7 +1955,7 @@ internal static class AfcMetadataCache
 
     public static void InvalidatePath(string? udid, string remotePath)
     {
-        string normalizedPath = NormalizeRemotePath(remotePath);
+        string normalizedPath = NormalizePath(remotePath);
         string cachePrefix = $"{GetDeviceKey(udid)}|";
         string pathPrefix = normalizedPath == "/" ? "/" : $"{normalizedPath.TrimEnd('/')}/";
 
@@ -1960,7 +1984,7 @@ internal static class AfcMetadataCache
             string keyPath = key[cachePrefix.Length..];
             if (string.Equals(keyPath, normalizedPath, StringComparison.Ordinal) ||
                 keyPath.StartsWith(pathPrefix, StringComparison.Ordinal) ||
-                string.Equals(GetParentRemotePath(keyPath) ?? "/", normalizedPath, StringComparison.Ordinal))
+                string.Equals(GetParentPath(keyPath) ?? "/", normalizedPath, StringComparison.Ordinal))
             {
                 DirectoryEntries.TryRemove(key, out _);
             }
@@ -1970,6 +1994,40 @@ internal static class AfcMetadataCache
     private static string BuildCacheKey(string? udid, string normalizedPath) => $"{GetDeviceKey(udid)}|{normalizedPath}";
 
     private static string GetDeviceKey(string? udid) => string.IsNullOrWhiteSpace(udid) ? "default-device" : udid.Trim();
+
+    private static string NormalizePath(string remotePath)
+    {
+        if (string.IsNullOrWhiteSpace(remotePath))
+        {
+            return "/";
+        }
+
+        string normalized = remotePath.Replace('\\', '/').Trim();
+        if (normalized == "/")
+        {
+            return "/";
+        }
+
+        return normalized.Trim('/');
+    }
+
+    private static string? GetParentPath(string remotePath)
+    {
+        string normalized = NormalizePath(remotePath);
+        if (normalized == "/")
+        {
+            return null;
+        }
+
+        string trimmed = normalized.Trim('/');
+        int separatorIndex = trimmed.LastIndexOf('/');
+        if (separatorIndex < 0)
+        {
+            return "/";
+        }
+
+        return trimmed[..separatorIndex];
+    }
 
     private sealed class CacheEntry<T>(T value)
     {
@@ -1986,27 +2044,27 @@ internal static class MediaIndexStore
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> RefreshLocks = new(StringComparer.Ordinal);
     private static readonly TimeSpan StaleAfter = TimeSpan.FromSeconds(45);
 
-    public static async Task<MediaEnumerationResult> GetOrBuildAsync(string? udid, bool includeAdditionalRoots)
+    public static async Task<MediaEnumerationResult> GetOrBuildAsync(string? udid, bool includeAdditionalRoots, Func<MediaEnumerationResult> refreshFactory)
     {
         string key = BuildKey(udid, includeAdditionalRoots);
         if (Snapshots.TryGetValue(key, out CacheEntry<MediaEnumerationResult>? snapshot))
         {
             if (snapshot.IsExpired(StaleAfter))
             {
-                _ = TriggerRefreshAsync(udid, includeAdditionalRoots);
+                _ = TriggerRefreshAsync(udid, includeAdditionalRoots, refreshFactory);
             }
 
             return snapshot.Value;
         }
 
-        return await RefreshAsync(udid, includeAdditionalRoots);
+        return await RefreshAsync(udid, includeAdditionalRoots, refreshFactory);
     }
 
-    public static async Task TriggerRefreshAsync(string? udid, bool includeAdditionalRoots)
+    public static async Task TriggerRefreshAsync(string? udid, bool includeAdditionalRoots, Func<MediaEnumerationResult> refreshFactory)
     {
         try
         {
-            await RefreshAsync(udid, includeAdditionalRoots);
+            await RefreshAsync(udid, includeAdditionalRoots, refreshFactory);
         }
         catch
         {
@@ -2025,7 +2083,7 @@ internal static class MediaIndexStore
         }
     }
 
-    private static async Task<MediaEnumerationResult> RefreshAsync(string? udid, bool includeAdditionalRoots)
+    private static async Task<MediaEnumerationResult> RefreshAsync(string? udid, bool includeAdditionalRoots, Func<MediaEnumerationResult> refreshFactory)
     {
         string key = BuildKey(udid, includeAdditionalRoots);
         SemaphoreSlim refreshLock = RefreshLocks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
@@ -2039,8 +2097,7 @@ internal static class MediaIndexStore
 
             return await Task.Run(() =>
             {
-                using AfcSession session = AfcSession.Connect(udid);
-                MediaEnumerationResult refreshed = EnumerateMediaAssets(session.AfcClient, includeAdditionalRoots, udid);
+                MediaEnumerationResult refreshed = refreshFactory();
                 Snapshots[key] = new CacheEntry<MediaEnumerationResult>(refreshed);
                 return refreshed;
             });
