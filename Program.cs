@@ -1670,14 +1670,34 @@ internal static class UiPage
       color: var(--muted);
       white-space: nowrap;
     }
-    .toggle input[type="checkbox"] {
+    input[type="checkbox"] {
       width: 18px;
       height: 18px;
       margin: 0;
-      accent-color: var(--accent);
+      border: 1px solid #111;
+      border-radius: 4px;
+      background: #fff;
+      appearance: none;
+      -webkit-appearance: none;
+      display: inline-grid;
+      place-content: center;
+      cursor: pointer;
     }
-    .toggle input[type="checkbox"]:disabled {
+    input[type="checkbox"]::before {
+      content: "";
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      background: var(--accent);
+      transform: scale(0);
+      transition: transform .12s ease-in-out;
+    }
+    input[type="checkbox"]:checked::before {
+      transform: scale(1);
+    }
+    input[type="checkbox"]:disabled {
       opacity: .55;
+      cursor: not-allowed;
     }
     button {
       border: 0;
