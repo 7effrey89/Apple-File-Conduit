@@ -3160,9 +3160,41 @@ internal static class UiPage
       word-break: break-all;
     }
     .fs-row .meta {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 6px;
       color: var(--muted);
       font-size: .85rem;
       white-space: nowrap;
+    }
+    .fs-inline-status {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 28px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(40,103,255,0.08);
+      color: #1e4fd6;
+      font-size: .8rem;
+      font-weight: 600;
+      max-width: min(260px, 100%);
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .fs-inline-status.succeeded {
+      background: rgba(43,122,62,0.1);
+      color: #2b7a3e;
+    }
+    .fs-inline-status.failed {
+      background: rgba(182,56,56,0.1);
+      color: #b63838;
+    }
+    .fs-inline-status.queued {
+      background: rgba(130,145,180,0.12);
+      color: var(--muted);
     }
     @media (max-width: 900px) {
       .toolbar { grid-template-columns: 1fr 1fr; }
@@ -3172,6 +3204,7 @@ internal static class UiPage
       .page { padding: 16px; }
       .toolbar { grid-template-columns: 1fr; }
       .fs-row { grid-template-columns: 1fr; }
+      .fs-row .meta { align-items: flex-start; }
     }
     .settings-btn {
       background: none;
@@ -3551,6 +3584,7 @@ internal static class UiPage
       fsParentPath: '/',
       fsEntries: [],
       fsSelected: new Set(),
+      transferProgressSnapshot: null,
       transferProgressOperationId: null,
       transferProgressTimer: null
     };
@@ -3691,6 +3725,22 @@ internal static class UiPage
       return 'Queued';
     }
 
+    function isFsTransferProgress(progress = state.transferProgressSnapshot) {
+      return Boolean(progress?.label && progress.label.toLowerCase().includes('file system items'));
+    }
+
+    function getFsProgressByPath() {
+      if (!isFsTransferProgress() || !state.transferProgressSnapshot?.items?.length) {
+        return new Map();
+      }
+
+      return new Map(
+        state.transferProgressSnapshot.items
+          .filter(item => item?.remotePath)
+          .map(item => [item.remotePath, item])
+      );
+    }
+
     function progressPercentForItem(item) {
       if (item.status === 'succeeded') return 100;
       if (item.status === 'failed') return item.totalBytes > 0 ? Math.min(100, (item.bytesCopied / item.totalBytes) * 100) : 100;
@@ -3699,10 +3749,25 @@ internal static class UiPage
     }
 
     function renderTransferProgress(progress) {
+      const previousWasFsProgress = isFsTransferProgress();
+      state.transferProgressSnapshot = progress ?? null;
+      const fsProgress = isFsTransferProgress(progress);
+
       if (!progress) {
         transferProgressPanel.classList.add('hidden');
         transferProgressList.innerHTML = '';
         transferProgressSummary.textContent = '';
+        if (previousWasFsProgress) {
+          renderFsList();
+        }
+        return;
+      }
+
+      if (fsProgress) {
+        transferProgressPanel.classList.add('hidden');
+        transferProgressList.innerHTML = '';
+        transferProgressSummary.textContent = '';
+        renderFsList();
         return;
       }
 
@@ -3735,6 +3800,10 @@ internal static class UiPage
           <div class="tp-path">${escapeHtml(item.remotePath)}</div>
         `;
         transferProgressList.appendChild(row);
+      }
+
+      if (previousWasFsProgress) {
+        renderFsList();
       }
     }
 
@@ -4031,6 +4100,7 @@ internal static class UiPage
         return;
       }
 
+      const progressByPath = getFsProgressByPath();
       fsList.innerHTML = '';
       for (const entry of state.fsEntries) {
         const row = document.createElement('div');
@@ -4056,9 +4126,21 @@ internal static class UiPage
 
         const controls = document.createElement('div');
         controls.className = 'meta';
-        controls.textContent = entry.isDirectory
+        const progressItem = progressByPath.get(entry.path);
+        if (progressItem) {
+          const statusBadge = document.createElement('div');
+          statusBadge.className = `fs-inline-status ${progressItem.status}`;
+          const statusText = statusTextForProgressItem(progressItem);
+          statusBadge.textContent = statusText;
+          statusBadge.title = statusText;
+          controls.appendChild(statusBadge);
+        }
+
+        const metaText = document.createElement('div');
+        metaText.textContent = entry.isDirectory
           ? 'Folder'
           : `${formatBytes(entry.sizeBytes ?? 0)}`;
+        controls.appendChild(metaText);
 
         if (entry.isDirectory) {
           const openButton = document.createElement('button');
@@ -4067,7 +4149,6 @@ internal static class UiPage
             event.preventDefault();
             loadFs(entry.path);
           });
-          controls.innerHTML = '';
           controls.appendChild(openButton);
         }
 
