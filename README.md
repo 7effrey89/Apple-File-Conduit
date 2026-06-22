@@ -1,6 +1,8 @@
 # Apple-File-Conduit
 
-Minimal C# console demo that copies a file from an iPhone using Apple's AFC service via the open-source `libimobiledevice` stack.
+Minimal C# app that can either run AFC copy/list/move commands directly or launch a local browser UI for browsing photos, live photos, and videos from an iPhone via the open-source `libimobiledevice` stack.
+
+The UI media pipeline uses the **AFC** (Apple File Conduit) transport for media enumeration/metadata, media deletion, file copy/move operations, and filesystem browsing.
 
 ## Prerequisites
 
@@ -39,7 +41,25 @@ dotnet build /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileCo
 dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [list|--list] <remoteDirectoryPath> [deviceUdid]
 dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [copy|--copy] <remoteFilePath> <localOutputPath> [deviceUdid]
 dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [move|--move] <remoteFilePath> <localOutputPath> [deviceUdid]
+dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [ui|--ui] [deviceUdid]
 ```
+
+### UI example
+
+```bash
+dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- ui
+```
+
+The UI starts a local web server, opens a browser, and provides two views:
+
+- **Media view**: choose options (including **Include PhotoData**) and click **Scan Media** to load photo/live photo/video items, then copy or move selected media to an absolute local destination.
+- **File system view**: browse remote folders, select folders/files, and copy, move, or delete selected paths.
+
+- Enable **Include PhotoData** in the toolbar to also scan the optional `PhotoData` media tree when it is available through AFC.
+- The browser UI recognizes additional image formats including `.dng`, `.tif`, and `.tiff`. Formats that the browser cannot preview directly are still listed and can be copied or moved.
+- Media scans are cached and refreshed in the background for performance on repeated loads.
+- Use **Reset Cache** in the toolbar to clear cached media and file-system metadata for the connected device and force a fresh reload.
+- File system listings fetch metadata in parallel across multiple AFC sessions for faster large-folder browsing.
 
 ### List example
 
