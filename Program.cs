@@ -4397,6 +4397,10 @@ internal static class UiPage
         </div>
       </div>
       <button class="hidden" id="retryPtpButton" title="Clear the PTP retry cooldown and scan again using PTP">Retry PTP</button>
+      <button id="selectAllButton">Select All</button>
+      <button id="deselectAllButton">Deselect All</button>
+      <button class="hidden" id="fsSelectAllButton">Select All</button>
+      <button class="hidden" id="fsDeselectAllButton">Deselect All</button>
       <button class="primary" id="copyButton">Copy Selected</button>
       <button class="danger" id="moveButton">Move Selected</button>
       <button class="primary hidden" id="fsCopyButton">Copy Selected Paths</button>
@@ -4421,6 +4425,8 @@ internal static class UiPage
     <div class="fs-view hidden" id="fsView">
       <div class="fs-toolbar">
         <input id="fsPath" value="DCIM" placeholder="Remote folder path, for example DCIM or PhotoData">
+        <button id="fsSelectAllButton">Select All</button>
+        <button id="fsDeselectAllButton">Deselect All</button>
         <button id="fsOpenButton">Open Folder</button>
         <button id="fsUpButton">Up</button>
       </div>
@@ -4623,6 +4629,10 @@ internal static class UiPage
     const scanCachedButton = document.getElementById('scanCachedButton');
     const scanRecacheButton = document.getElementById('scanRecacheButton');
     const retryPtpButton = document.getElementById('retryPtpButton');
+    const selectAllButton = document.getElementById('selectAllButton');
+    const deselectAllButton = document.getElementById('deselectAllButton');
+    const fsSelectAllButton = document.getElementById('fsSelectAllButton');
+    const fsDeselectAllButton = document.getElementById('fsDeselectAllButton');
     const copyButton = document.getElementById('copyButton');
     const moveButton = document.getElementById('moveButton');
     const fsCopyButton = document.getElementById('fsCopyButton');
@@ -4685,6 +4695,10 @@ internal static class UiPage
       scanAndRecache();
     });
     retryPtpButton.addEventListener('click', () => retryPtp());
+    selectAllButton.addEventListener('click', () => selectAllMedia());
+    deselectAllButton.addEventListener('click', () => deselectAllMedia());
+    fsSelectAllButton.addEventListener('click', () => selectAllFs());
+    fsDeselectAllButton.addEventListener('click', () => deselectAllFs());
     copyButton.addEventListener('click', () => transfer('copy'));
     moveButton.addEventListener('click', () => transfer('move'));
     fsCopyButton.addEventListener('click', () => transferFs('copy'));
@@ -4762,6 +4776,10 @@ internal static class UiPage
       scanCachedButton.disabled = value;
       scanRecacheButton.disabled = value;
       retryPtpButton.disabled = value;
+      selectAllButton.disabled = value;
+      deselectAllButton.disabled = value;
+      fsSelectAllButton.disabled = value;
+      fsDeselectAllButton.disabled = value;
       fsCopyButton.disabled = value;
       fsMoveButton.disabled = value;
       fsDeleteButton.disabled = value;
@@ -5138,6 +5156,10 @@ internal static class UiPage
       filterInput.classList.toggle('hidden', fsMode);
       scanDropdown.classList.toggle('hidden', fsMode);
       retryPtpButton.classList.toggle('hidden', fsMode || !state.ptpFallbackActive);
+      selectAllButton.classList.toggle('hidden', fsMode);
+      deselectAllButton.classList.toggle('hidden', fsMode);
+      fsSelectAllButton.classList.toggle('hidden', !fsMode);
+      fsDeselectAllButton.classList.toggle('hidden', !fsMode);
       copyButton.classList.toggle('hidden', fsMode);
       moveButton.classList.toggle('hidden', fsMode);
       fsCopyButton.classList.toggle('hidden', !fsMode);
@@ -5630,6 +5652,37 @@ internal static class UiPage
 
       renderGrid();
       renderSummary();
+    }
+
+    function selectAllMedia() {
+      const visible = filteredItems();
+      for (const item of visible) {
+        state.selected.add(item.id);
+      }
+
+      renderGrid();
+      renderSummary();
+    }
+
+    function deselectAllMedia() {
+      state.selected.clear();
+      renderGrid();
+      renderSummary();
+    }
+
+    function selectAllFs() {
+      for (const entry of state.fsEntries) {
+        state.fsSelected.add(entry.path);
+      }
+
+      renderFsList();
+      renderFsSummary();
+    }
+
+    function deselectAllFs() {
+      state.fsSelected.clear();
+      renderFsList();
+      renderFsSummary();
     }
 
     async function loadMedia(forceRefresh = false) {
