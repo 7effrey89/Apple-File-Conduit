@@ -2,11 +2,7 @@
 
 Minimal C# app that can either run AFC copy/list/move commands directly or launch a local browser UI for browsing photos, live photos, and videos from an iPhone via the open-source `libimobiledevice` stack.
 
-The UI media pipeline uses a hybrid transport model:
-
-- **PTP** for media enumeration/metadata and media delete operations (Photos-safe object deletion)
-- **AFC** for file copy/move bytes and filesystem browsing operations
-- **AFC fallback** for media enumeration if PTP is unavailable
+The UI media pipeline uses the **AFC** (Apple File Conduit) transport for media enumeration/metadata, media deletion, file copy/move operations, and filesystem browsing.
 
 ## Prerequisites
 
@@ -46,21 +42,6 @@ dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/App
 dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [copy|--copy] <remoteFilePath> <localOutputPath> [deviceUdid]
 dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [move|--move] <remoteFilePath> <localOutputPath> [deviceUdid]
 dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [ui|--ui] [deviceUdid]
-dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- [ptp-test|--ptp-test] [--continuous] [--interval <seconds>] [deviceUdid]
-```
-
-### PTP diagnostic examples
-
-One-shot PTP probe:
-
-```bash
-dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- ptp-test
-```
-
-Continuous PTP probe every 3 seconds (Ctrl+C to stop):
-
-```bash
-dotnet run --project /home/runner/work/Apple-File-Conduit/Apple-File-Conduit/AppleFileConduitDemo.csproj -- ptp-test --continuous --interval 3
 ```
 
 ### UI example
@@ -76,10 +57,8 @@ The UI starts a local web server, opens a browser, and provides two views:
 
 - Enable **Include PhotoData** in the toolbar to also scan the optional `PhotoData` media tree when it is available through AFC.
 - The browser UI recognizes additional image formats including `.dng`, `.tif`, and `.tiff`. Formats that the browser cannot preview directly are still listed and can be copied or moved.
-- Media scans are cached and refreshed in the background so repeated loads avoid full rescans (PTP first, AFC fallback, with a short retry cooldown when PTP is unavailable).
+- Media scans are cached and refreshed in the background for performance on repeated loads.
 - Use **Reset Cache** in the toolbar to clear cached media and file-system metadata for the connected device and force a fresh reload.
-- When PTP is unavailable, the console prints extra troubleshooting details and common causes while the scan continues through AFC.
-- If a scan falls back to AFC, a **Retry PTP** button appears in the toolbar. Click it after unlocking/trusting the phone to clear the retry cooldown and immediately attempt a fresh PTP scan.
 - File system listings fetch metadata in parallel across multiple AFC sessions for faster large-folder browsing.
 
 ### List example

@@ -18,7 +18,6 @@ static async Task<int> MainAsync(string[] args)
     bool deleteSourceAfterCopy = false;
     bool listRemotePath = false;
     bool launchUi = false;
-  bool runPtpTest = false;
     int firstPathArgumentIndex = 0;
 
     if (args.Length > 0)
@@ -42,74 +41,11 @@ static async Task<int> MainAsync(string[] args)
             launchUi = true;
             firstPathArgumentIndex = 1;
         }
-        else if (args[0] is "--ptp-test" or "ptp-test")
-        {
-          runPtpTest = true;
-          firstPathArgumentIndex = 1;
-        }
     }
 
     string remotePath;
     string? localPath = null;
     string? udid;
-
-      if (runPtpTest)
-      {
-        bool continuous = false;
-        int intervalSeconds = 3;
-        string? ptpUdid = null;
-
-        for (int index = firstPathArgumentIndex; index < args.Length; index++)
-        {
-          string argument = args[index];
-
-          if (argument is "--continuous" or "-c")
-          {
-            continuous = true;
-            continue;
-          }
-
-          if (argument.StartsWith("--interval=", StringComparison.Ordinal))
-          {
-            if (!int.TryParse(argument["--interval=".Length..], out intervalSeconds) || intervalSeconds < 1)
-            {
-              Console.Error.WriteLine("Invalid --interval value. Use a positive integer number of seconds.");
-              return 1;
-            }
-
-            continue;
-          }
-
-          if (argument == "--interval")
-          {
-            if (index + 1 >= args.Length || !int.TryParse(args[index + 1], out intervalSeconds) || intervalSeconds < 1)
-            {
-              Console.Error.WriteLine("Invalid --interval value. Use a positive integer number of seconds.");
-              return 1;
-            }
-
-            index++;
-            continue;
-          }
-
-          if (argument.StartsWith("--udid=", StringComparison.Ordinal))
-          {
-            ptpUdid = argument["--udid=".Length..];
-            continue;
-          }
-
-          if (ptpUdid is null)
-          {
-            ptpUdid = argument;
-            continue;
-          }
-
-          WriteUsage();
-          return 1;
-        }
-
-        return await RunPtpDiagnosticAsync(ptpUdid, continuous, TimeSpan.FromSeconds(intervalSeconds));
-      }
 
     if (launchUi)
     {
@@ -189,143 +125,6 @@ static async Task<int> MainAsync(string[] args)
         return 1;
     }
 }
-
-static async Task<int> RunPtpDiagnosticAsync(string? udid, bool continuous, TimeSpan interval)
-{
-  if (!continuous)
-  {
-    bool success = RunPtpDiagnosticOnce(udid, out string resultLine);
-    Console.WriteLine(resultLine);
-    return success ? 0 : 1;
-  }
-
-  using CancellationTokenSource stop = new();
-  int totalRuns = 0;
-  int passedRuns = 0;
-  int failedRuns = 0;
-
-  void StopLoop(object? _, ConsoleCancelEventArgs eventArgs)
-  {
-    eventArgs.Cancel = true;
-    stop.Cancel();
-  }
-
-  Console.CancelKeyPress += StopLoop;
-  Console.WriteLine($"Running continuous PTP diagnostic every {interval.TotalSeconds:0} second(s). Press Ctrl+C to stop.");
-
-  try
-  {
-    while (!stop.IsCancellationRequested)
-    {
-      totalRuns++;
-      bool success = RunPtpDiagnosticOnce(udid, out string resultLine);
-      if (success)
-      {
-        passedRuns++;
-      }
-      else
-      {
-        failedRuns++;
-      }
-
-      Console.WriteLine(resultLine);
-
-      try
-      {
-        await Task.Delay(interval, stop.Token);
-      }
-      catch (OperationCanceledException)
-      {
-        break;
-      }
-    }
-  }
-  finally
-  {
-    Console.CancelKeyPress -= StopLoop;
-  }
-
-  Console.WriteLine($"PTP diagnostic summary: {passedRuns}/{totalRuns} passed, {failedRuns}/{totalRuns} failed.");
-  return passedRuns > 0 ? 0 : 1;
-}
-
-static bool RunPtpDiagnosticOnce(string? udid, out string resultLine)
-{
-  Stopwatch stopwatch = Stopwatch.StartNew();
-
-  try
-  {
-    using PtpSession session = PtpSession.Connect(udid);
-    session.OpenSession();
-
-    uint[] storageIds = session.GetStorageIds();
-    int totalObjects = 0;
-    uint? sampleHandle = null;
-
-    foreach (uint storageId in storageIds)
-    {
-      uint[] handles = session.GetObjectHandles(storageId);
-      totalObjects += handles.Length;
-
-      if (!sampleHandle.HasValue && handles.Length > 0)
-      {
-        sampleHandle = handles[0];
-      }
-    }
-
-    if (sampleHandle.HasValue)
-    {
-      _ = session.GetObjectInfo(sampleHandle.Value);
-    }
-
-    stopwatch.Stop();
-    resultLine = $"[{DateTimeOffset.Now:HH:mm:ss}] PASS PTP connected. Storages={storageIds.Length}, Objects={totalObjects}, Duration={stopwatch.ElapsedMilliseconds}ms.";
-    return true;
-  }
-  catch (Exception ex)
-  {
-    stopwatch.Stop();
-    bool messageIncludesNativeCode = ex.Message.Contains("Native error code:", StringComparison.Ordinal);
-    string nativeErrorSuffix = !messageIncludesNativeCode && TryGetNativeErrorCode(ex, out int errorCode)
-      ? $" Native error code: {errorCode}."
-      : string.Empty;
-    resultLine = $"[{DateTimeOffset.Now:HH:mm:ss}] FAIL PTP diagnostic after {stopwatch.ElapsedMilliseconds}ms. {ex.Message}{nativeErrorSuffix}";
-    return false;
-  }
-}
-
-  static PtpStatusResponse GetPtpStatus(string? udid)
-  {
-    Stopwatch stopwatch = Stopwatch.StartNew();
-
-    try
-    {
-      using PtpSession session = PtpSession.Connect(udid);
-      session.OpenSession();
-      int storageCount = session.GetStorageIds().Length;
-
-      stopwatch.Stop();
-      return new PtpStatusResponse(
-        true,
-        $"PTP available ({storageCount} storage(s) detected).",
-        null,
-        null,
-        stopwatch.ElapsedMilliseconds
-      );
-    }
-    catch (Exception ex)
-    {
-      stopwatch.Stop();
-      int? nativeErrorCode = TryGetNativeErrorCode(ex, out int parsedCode) ? parsedCode : null;
-      return new PtpStatusResponse(
-        false,
-        "PTP unavailable for this session.",
-        nativeErrorCode,
-        ex.Message,
-        stopwatch.ElapsedMilliseconds
-      );
-    }
-  }
 
 static async Task<int> RunUiAsync(string? udid)
 {
@@ -825,7 +624,6 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
                     }
                 }
 
-                using PtpSession? ptpSession = selectedAssets.Any(x => x.PtpObjectHandlesByPath.Count > 0) ? PtpSession.TryConnect(udid) : null;
                 foreach (MediaAsset asset in selectedAssets)
                 {
                     if (asset.RemotePaths.Any(path => !verifiedRemotePaths.Contains(path)))
@@ -835,7 +633,7 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
 
                     try
                     {
-                        DeleteMediaAssetSources(asset, session.AfcClient, ptpSession, udid);
+                        DeleteMediaAssetSources(asset, session.AfcClient, udid);
                         foreach (string remotePath in asset.RemotePaths)
                         {
                             AfcMetadataCache.InvalidatePath(udid, remotePath);
@@ -976,23 +774,8 @@ static async Task HandleUiRequestAsync(HttpListenerContext context, string? udid
             return;
         }
 
-        if (path == "/api/ptp-retry" && context.Request.HttpMethod == "POST")
-        {
-            MediaIndexStore.PtpFallbackState.Clear(udid);
-            MediaIndexStore.MarkDirty(udid);
-            await WriteJsonResponseAsync(context.Response, new { message = "PTP retry state cleared. The next scan will attempt PTP." });
-            return;
-        }
-
-        if (path == "/api/ptp-status" && context.Request.HttpMethod == "GET")
-        {
-          await WriteJsonResponseAsync(context.Response, GetPtpStatus(udid));
-          return;
-        }
-
         if (path == "/api/cache/reset" && context.Request.HttpMethod == "POST")
         {
-            MediaIndexStore.PtpFallbackState.Clear(udid);
             MediaIndexStore.MarkDirty(udid);
             AfcMetadataCache.InvalidateAll(udid);
             await WriteJsonResponseAsync(context.Response, new { message = "Cache reset. The next load will fetch fresh data." });
@@ -1345,7 +1128,6 @@ static void WriteUsage()
 {
     Console.WriteLine("Usage:");
     Console.WriteLine("  AppleFileConduitDemo [ui|--ui] [deviceUdid]");
-  Console.WriteLine("  AppleFileConduitDemo [ptp-test|--ptp-test] [--continuous] [--interval <seconds>] [deviceUdid|--udid=<deviceUdid>]");
     Console.WriteLine("  AppleFileConduitDemo [list|--list] <remoteDirectoryPath> [deviceUdid]");
     Console.WriteLine("  AppleFileConduitDemo [copy|--copy] <remoteFilePath> <localOutputPath> [deviceUdid]");
     Console.WriteLine("  AppleFileConduitDemo [move|--move] <remoteFilePath> <localOutputPath> [deviceUdid]");
@@ -1478,113 +1260,9 @@ static void ListRemoteDirectory(IntPtr afcClient, string remotePath)
 
 static MediaEnumerationResult EnumerateMediaAssetsHybrid(bool includeAdditionalRoots, string? udid = null)
 {
-    if (MediaIndexStore.PtpFallbackState.ShouldBypassPtp(udid))
-    {
-        LogPtpFallbackDiagnostics(cachedBypass: true);
-        using AfcSession afcSession = AfcSession.Connect(udid);
-        return EnumerateMediaAssetsViaAfc(afcSession.AfcClient, includeAdditionalRoots, udid) with
-        {
-            BackendNote = BuildPtpUnavailableNote()
-        };
-    }
-
-    try
-    {
-        using PtpSession ptpSession = PtpSession.Connect(udid);
-        MediaIndexStore.PtpFallbackState.Clear(udid);
-        List<PtpMediaObject> ptpObjects = EnumerateMediaObjectsViaPtp(ptpSession);
-        MediaEnumerationResult ptpResult = BuildMediaEnumerationResult(
-            ptpObjects.Select(x => new RemoteFileEntry(x.RemotePath)).ToList(),
-            scannedRoots: ["DCIM"],
-            backend: "ptp",
-            ptpHandlesByPath: ptpObjects.ToDictionary(x => x.RemotePath, x => x.ObjectHandle, StringComparer.OrdinalIgnoreCase)
-        );
-
-        if (!includeAdditionalRoots)
-        {
-            return ptpResult;
-        }
-
-        try
-        {
-            using AfcSession afcSession = AfcSession.Connect(udid);
-            MediaEnumerationResult afcWithAdditionalRoots = EnumerateMediaAssetsViaAfc(afcSession.AfcClient, includeAdditionalRoots: true, udid);
-            List<MediaAsset> mergedAssets = ptpResult.Assets
-                .Concat(afcWithAdditionalRoots.Assets.Where(
-                    candidate => ptpResult.Assets.All(existing => !string.Equals(existing.PrimaryRemotePath, candidate.PrimaryRemotePath, StringComparison.OrdinalIgnoreCase))
-                ))
-                .ToList();
-            return new MediaEnumerationResult(mergedAssets, afcWithAdditionalRoots.ScannedRoots, "hybrid");
-        }
-        catch
-        {
-            return ptpResult;
-        }
-    }
-    catch (Exception ex)
-    {
-        if (IsPtpServiceUnavailable(ex))
-        {
-            MediaIndexStore.PtpFallbackState.MarkPtpUnavailable(udid);
-        }
-
-        string backendNote = BuildPtpFallbackNote(ex);
-        LogPtpFallbackDiagnostics(ex);
-        using AfcSession afcSession = AfcSession.Connect(udid);
-        return EnumerateMediaAssetsViaAfc(afcSession.AfcClient, includeAdditionalRoots, udid) with
-        {
-            BackendNote = backendNote
-        };
-    }
+    using AfcSession afcSession = AfcSession.Connect(udid);
+    return EnumerateMediaAssetsViaAfc(afcSession.AfcClient, includeAdditionalRoots, udid);
 }
-
-static string BuildPtpFallbackNote(Exception ex)
-{
-    if (IsPtpServiceUnavailable(ex))
-    {
-        return BuildPtpUnavailableNote();
-    }
-
-    return "PTP media enumeration was unavailable, so media was loaded through AFC instead.";
-}
-
-static string BuildPtpFallbackLogMessage(Exception ex)
-{
-    if (IsPtpServiceUnavailable(ex))
-    {
-        return "PTP service is unavailable on this device; using AFC fallback for media enumeration.";
-    }
-
-    return $"PTP media enumeration failed, falling back to AFC. {ex.Message}";
-}
-
-static void LogPtpFallbackDiagnostics(Exception? ex = null, bool cachedBypass = false)
-{
-    Console.WriteLine(cachedBypass
-        ? "PTP service is still in a short retry cooldown for this device; using AFC fallback without another PTP probe."
-        : BuildPtpFallbackLogMessage(ex!));
-    Console.WriteLine("Scan note: if your scan still shows files, this fallback is informational and not a fatal error.");
-    if (ex is not null)
-    {
-        Console.WriteLine($"PTP detail: {ex.Message}");
-        if (TryGetNativeErrorCode(ex, out int errorCode))
-        {
-            Console.WriteLine($"PTP native error code: {errorCode}");
-        }
-    }
-
-    Console.WriteLine("Common causes:");
-    Console.WriteLine(" - iPhone is not fully unlocked.");
-    Console.WriteLine(" - This computer has not been fully trusted by the device.");
-    Console.WriteLine(" - The USB connection or cable is unstable.");
-    Console.WriteLine(" - usbmuxd or libimobiledevice is not healthy on this machine.");
-    Console.WriteLine(" - This iPhone/iOS session is not offering the PTP service right now.");
-    Console.WriteLine("Expected behavior: the app tries PTP first and falls back to AFC when PTP is unavailable.");
-}
-
-static string BuildPtpUnavailableNote() => "PTP is not available on this device, so media was loaded through AFC instead.";
-
-static bool IsPtpServiceUnavailable(Exception ex) => TryGetNativeErrorCode(ex, out int errorCode) && errorCode == -27;
 
 static MediaEnumerationResult EnumerateMediaAssetsViaAfc(IntPtr afcClient, bool includeAdditionalRoots, string? udid = null)
 {
@@ -1615,8 +1293,7 @@ static MediaEnumerationResult EnumerateMediaAssetsViaAfc(IntPtr afcClient, bool 
 static MediaEnumerationResult BuildMediaEnumerationResult(
     List<RemoteFileEntry> files,
     string[] scannedRoots,
-    string backend,
-    Dictionary<string, uint>? ptpHandlesByPath = null
+    string backend
 )
 {
     files = files.DistinctBy(x => x.Path, StringComparer.OrdinalIgnoreCase).ToList();
@@ -1644,7 +1321,7 @@ static MediaEnumerationResult BuildMediaEnumerationResult(
                     MediaKind.LivePhoto,
                     image.Path,
                     new[] { image.Path, pairedVideo.Path },
-                    BuildPtpHandleMap(new[] { image.Path, pairedVideo.Path }, ptpHandlesByPath),
+                    new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase),
                     backend
                 )
             );
@@ -1658,7 +1335,7 @@ static MediaEnumerationResult BuildMediaEnumerationResult(
                 MediaKind.Photo,
                 image.Path,
                 new[] { image.Path },
-                BuildPtpHandleMap(new[] { image.Path }, ptpHandlesByPath),
+                new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase),
                 backend
             )
         );
@@ -1678,7 +1355,7 @@ static MediaEnumerationResult BuildMediaEnumerationResult(
                 MediaKind.Video,
                 video.Path,
                 new[] { video.Path },
-                BuildPtpHandleMap(new[] { video.Path }, ptpHandlesByPath),
+                new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase),
                 backend
             )
         );
@@ -1691,125 +1368,8 @@ static MediaEnumerationResult BuildMediaEnumerationResult(
     );
 }
 
-static IReadOnlyDictionary<string, uint> BuildPtpHandleMap(IEnumerable<string> remotePaths, Dictionary<string, uint>? ptpHandlesByPath)
+static void DeleteMediaAssetSources(MediaAsset asset, IntPtr afcClient, string? udid = null)
 {
-    if (ptpHandlesByPath is null)
-    {
-        return new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
-    }
-
-    Dictionary<string, uint> result = new(StringComparer.OrdinalIgnoreCase);
-    foreach (string remotePath in remotePaths)
-    {
-        if (ptpHandlesByPath.TryGetValue(remotePath, out uint handle))
-        {
-        result[remotePath] = handle;
-        }
-    }
-
-    return result;
-}
-
-static List<PtpMediaObject> EnumerateMediaObjectsViaPtp(PtpSession session)
-{
-    List<PtpMediaObject> mediaObjects = [];
-    session.OpenSession();
-    uint[] storageIds = session.GetStorageIds();
-    foreach (uint storageId in storageIds)
-    {
-        uint[] handles = session.GetObjectHandles(storageId);
-        Dictionary<uint, PtpObjectInfo> infos = new(handles.Length);
-        foreach (uint handle in handles)
-        {
-            infos[handle] = session.GetObjectInfo(handle);
-        }
-
-        foreach ((uint handle, PtpObjectInfo info) in infos)
-        {
-            if (info.IsAssociation || string.IsNullOrWhiteSpace(info.FileName))
-            {
-                continue;
-            }
-
-            string path = BuildPtpRemotePath(infos, handle);
-            if (string.IsNullOrWhiteSpace(path))
-            {
-                continue;
-            }
-
-            mediaObjects.Add(new PtpMediaObject(handle, path));
-        }
-    }
-
-    return mediaObjects
-        .Where(x => x.RemotePath.StartsWith("DCIM/", StringComparison.OrdinalIgnoreCase))
-        .DistinctBy(x => x.RemotePath, StringComparer.OrdinalIgnoreCase)
-        .ToList();
-}
-
-static string BuildPtpRemotePath(IReadOnlyDictionary<uint, PtpObjectInfo> infos, uint handle)
-{
-    if (!infos.TryGetValue(handle, out PtpObjectInfo? current))
-    {
-        return string.Empty;
-    }
-
-    List<string> segments = [];
-    if (!string.IsNullOrWhiteSpace(current.FileName))
-    {
-        segments.Add(current.FileName);
-    }
-
-    uint parent = current.ParentObject;
-    int guard = 0;
-    while (parent != 0 && parent != 0xFFFFFFFF && guard++ < 1024)
-    {
-        if (!infos.TryGetValue(parent, out PtpObjectInfo? parentInfo))
-        {
-            break;
-        }
-
-        if (!string.IsNullOrWhiteSpace(parentInfo.FileName))
-        {
-            segments.Add(parentInfo.FileName);
-        }
-
-        parent = parentInfo.ParentObject;
-    }
-
-    segments.Reverse();
-    if (segments.Count == 0)
-    {
-        return string.Empty;
-    }
-
-    if (!string.Equals(segments[0], "DCIM", StringComparison.OrdinalIgnoreCase))
-    {
-        segments.Insert(0, "DCIM");
-    }
-
-    return string.Join("/", segments.Select(x => x.Trim('/')));
-}
-
-static void DeleteMediaAssetSources(MediaAsset asset, IntPtr afcClient, PtpSession? ptpSession, string? udid = null)
-{
-    HashSet<uint> ptpHandles = asset.PtpObjectHandlesByPath.Values.ToHashSet();
-    if (ptpHandles.Count > 0)
-    {
-        if (ptpSession is null)
-        {
-            throw new InvalidOperationException("PTP delete requested but PTP session is unavailable.");
-        }
-
-        ptpSession.OpenSession();
-        foreach (uint handle in ptpHandles)
-        {
-            ptpSession.DeleteObject(handle);
-        }
-
-        return;
-    }
-
     foreach (string remotePath in asset.RemotePaths.Distinct(StringComparer.OrdinalIgnoreCase))
     {
         ThrowIfError(NativeMethods.afc_remove_path(afcClient, remotePath), $"Unable to delete remote file '{remotePath}'");
@@ -2462,440 +2022,6 @@ internal struct LockdownServiceDescriptorRaw
     public byte SslEnabled;
 }
 
-internal sealed class PtpSession : IDisposable
-{
-  private static readonly string[] PtpServiceIdentifiers = ["com.apple.ptp", "com.apple.mobile.ptp"];
-
-    private const ushort PtpContainerTypeCommand = 1;
-    private const ushort PtpContainerTypeData = 2;
-    private const ushort PtpContainerTypeResponse = 3;
-
-    private const ushort PtpOperationOpenSession = 0x1002;
-    private const ushort PtpOperationGetStorageIds = 0x1004;
-    private const ushort PtpOperationGetObjectHandles = 0x1007;
-    private const ushort PtpOperationGetObjectInfo = 0x1008;
-    private const ushort PtpOperationDeleteObject = 0x100B;
-
-    private const ushort PtpResponseOk = 0x2001;
-
-    private IntPtr _connection;
-    private uint _nextTransactionId = 1;
-    private bool _sessionOpened;
-
-    private PtpSession(IntPtr device, IntPtr lockdowndClient, IntPtr serviceDescriptor, IntPtr connection)
-    {
-        Device = device;
-        LockdowndClient = lockdowndClient;
-        ServiceDescriptor = serviceDescriptor;
-        _connection = connection;
-    }
-
-    public IntPtr Device { get; }
-    public IntPtr LockdowndClient { get; }
-    public IntPtr ServiceDescriptor { get; }
-
-    public static PtpSession Connect(string? udid)
-    {
-        IntPtr device = IntPtr.Zero;
-        IntPtr lockdowndClient = IntPtr.Zero;
-        IntPtr serviceDescriptor = IntPtr.Zero;
-        IntPtr connection = IntPtr.Zero;
-
-        try
-        {
-            NativeError.ThrowIfError(NativeMethods.idevice_new(ref device, udid), "Unable to connect to iOS device");
-            NativeError.ThrowIfError(
-                NativeMethods.lockdownd_client_new_with_handshake(device, ref lockdowndClient, "AppleFileConduitDemo"),
-                "Unable to start lockdownd session"
-            );
-
-            int lastServiceError = 0;
-            foreach (string serviceName in PtpServiceIdentifiers)
-            {
-                serviceDescriptor = IntPtr.Zero;
-                int startError = NativeMethods.lockdownd_start_service(lockdowndClient, serviceName, ref serviceDescriptor);
-                if (startError != 0)
-                {
-                    // Some iOS builds only allow service startup with an escrow bag.
-                    serviceDescriptor = IntPtr.Zero;
-                    startError = NativeMethods.lockdownd_start_service_with_escrow_bag(lockdowndClient, serviceName, ref serviceDescriptor);
-                }
-
-                if (startError == 0 && serviceDescriptor != IntPtr.Zero)
-                {
-                    break;
-                }
-
-                lastServiceError = startError;
-                if (serviceDescriptor != IntPtr.Zero)
-                {
-                    NativeMethods.lockdownd_service_descriptor_free(serviceDescriptor);
-                    serviceDescriptor = IntPtr.Zero;
-                }
-            }
-
-            if (serviceDescriptor == IntPtr.Zero)
-            {
-                throw new InvalidOperationException(
-                    $"Unable to start PTP service. Tried: {string.Join(", ", PtpServiceIdentifiers)}. Native error code: {lastServiceError}"
-                );
-            }
-
-            LockdownServiceDescriptorRaw descriptor = Marshal.PtrToStructure<LockdownServiceDescriptorRaw>(serviceDescriptor);
-            if (descriptor.Port == 0)
-            {
-                throw new InvalidOperationException("PTP service returned an invalid port.");
-            }
-
-            NativeError.ThrowIfError(NativeMethods.idevice_connect(device, descriptor.Port, ref connection), "Unable to connect to PTP service");
-            if (descriptor.SslEnabled != 0)
-            {
-                NativeError.ThrowIfError(NativeMethods.idevice_connection_enable_ssl(connection), "Unable to enable PTP SSL");
-            }
-
-            return new PtpSession(device, lockdowndClient, serviceDescriptor, connection);
-        }
-        catch
-        {
-            if (connection != IntPtr.Zero)
-            {
-                NativeMethods.idevice_disconnect(connection);
-            }
-
-            if (serviceDescriptor != IntPtr.Zero)
-            {
-                NativeMethods.lockdownd_service_descriptor_free(serviceDescriptor);
-            }
-
-            if (lockdowndClient != IntPtr.Zero)
-            {
-                NativeMethods.lockdownd_client_free(lockdowndClient);
-            }
-
-            if (device != IntPtr.Zero)
-            {
-                NativeMethods.idevice_free(device);
-            }
-
-            throw;
-        }
-    }
-
-    public static PtpSession? TryConnect(string? udid)
-    {
-        try
-        {
-            return Connect(udid);
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    public void OpenSession()
-    {
-        if (_sessionOpened)
-        {
-            return;
-        }
-
-        (_, ushort response, _) = ExecuteOperation(PtpOperationOpenSession, 1);
-        if (response != PtpResponseOk)
-        {
-            throw new InvalidOperationException($"PTP OpenSession failed with response 0x{response:X4}.");
-        }
-
-        _sessionOpened = true;
-    }
-
-    public uint[] GetStorageIds()
-    {
-        byte[] payload = ExecuteDataOperation(PtpOperationGetStorageIds);
-        return ReadPtpUInt32Array(payload);
-    }
-
-    public uint[] GetObjectHandles(uint storageId)
-    {
-        byte[] payload = ExecuteDataOperation(PtpOperationGetObjectHandles, storageId, 0, 0xFFFFFFFF);
-        return ReadPtpUInt32Array(payload);
-    }
-
-    public PtpObjectInfo GetObjectInfo(uint handle)
-    {
-        byte[] payload = ExecuteDataOperation(PtpOperationGetObjectInfo, handle);
-        return ParseObjectInfo(payload);
-    }
-
-    public void DeleteObject(uint handle)
-    {
-        (_, ushort response, _) = ExecuteOperation(PtpOperationDeleteObject, handle, 0);
-        if (response != PtpResponseOk)
-        {
-            throw new InvalidOperationException($"PTP DeleteObject({handle}) failed with response 0x{response:X4}.");
-        }
-    }
-
-    public void Dispose()
-    {
-        if (_connection != IntPtr.Zero)
-        {
-            NativeMethods.idevice_connection_disable_ssl(_connection);
-            NativeMethods.idevice_disconnect(_connection);
-            _connection = IntPtr.Zero;
-        }
-
-        if (ServiceDescriptor != IntPtr.Zero)
-        {
-            NativeMethods.lockdownd_service_descriptor_free(ServiceDescriptor);
-        }
-
-        if (LockdowndClient != IntPtr.Zero)
-        {
-            NativeMethods.lockdownd_client_free(LockdowndClient);
-        }
-
-        if (Device != IntPtr.Zero)
-        {
-            NativeMethods.idevice_free(Device);
-        }
-    }
-
-    private byte[] ExecuteDataOperation(ushort operationCode, params uint[] parameters)
-    {
-        (byte[]? payload, ushort response, _) = ExecuteOperation(operationCode, parameters);
-        if (response != PtpResponseOk)
-        {
-            throw new InvalidOperationException($"PTP op 0x{operationCode:X4} failed with response 0x{response:X4}.");
-        }
-
-        return payload ?? Array.Empty<byte>();
-    }
-
-    private (byte[]? Payload, ushort ResponseCode, uint[] ResponseParameters) ExecuteOperation(ushort operationCode, params uint[] parameters)
-    {
-        uint transactionId = _nextTransactionId++;
-        SendContainer(PtpContainerTypeCommand, operationCode, transactionId, parameters, payload: null);
-
-        PtpContainer first = ReadContainer();
-        if (first.Type == PtpContainerTypeResponse)
-        {
-            return (null, first.Code, first.Parameters);
-        }
-
-        if (first.Type != PtpContainerTypeData)
-        {
-            throw new InvalidOperationException($"Unexpected PTP container type {first.Type}.");
-        }
-
-        PtpContainer response = ReadContainer();
-        if (response.Type != PtpContainerTypeResponse)
-        {
-            throw new InvalidOperationException("PTP response container was missing.");
-        }
-
-        return (first.Payload, response.Code, response.Parameters);
-    }
-
-    private void SendContainer(ushort type, ushort code, uint transactionId, uint[]? parameters, byte[]? payload)
-    {
-        int parameterCount = parameters?.Length ?? 0;
-        int payloadLength = payload?.Length ?? 0;
-        int totalLength = 12 + (parameterCount * 4) + payloadLength;
-        byte[] buffer = new byte[totalLength];
-
-        WriteUInt32(buffer, 0, (uint)totalLength);
-        WriteUInt16(buffer, 4, type);
-        WriteUInt16(buffer, 6, code);
-        WriteUInt32(buffer, 8, transactionId);
-
-        int offset = 12;
-        if (parameters is not null)
-        {
-            foreach (uint parameter in parameters)
-            {
-                WriteUInt32(buffer, offset, parameter);
-                offset += 4;
-            }
-        }
-
-        if (payloadLength > 0)
-        {
-            Buffer.BlockCopy(payload!, 0, buffer, offset, payloadLength);
-        }
-
-        SendBytes(buffer);
-    }
-
-    private void SendBytes(byte[] data)
-    {
-        int offset = 0;
-        while (offset < data.Length)
-        {
-            byte[] chunk = offset == 0 ? data : data[offset..];
-            uint sent = 0;
-            NativeError.ThrowIfError(NativeMethods.idevice_connection_send(_connection, chunk, (uint)chunk.Length, ref sent), "Unable to send PTP data");
-            if (sent == 0)
-            {
-                throw new IOException("PTP send returned zero bytes.");
-            }
-
-            offset += (int)sent;
-        }
-    }
-
-    private PtpContainer ReadContainer()
-    {
-        byte[] lengthBytes = ReceiveExact(4);
-        uint length = ReadUInt32(lengthBytes, 0);
-        if (length < 12)
-        {
-            throw new InvalidOperationException($"Invalid PTP container length: {length}.");
-        }
-
-        byte[] remainder = ReceiveExact((int)length - 4);
-        ushort type = ReadUInt16(remainder, 0);
-        ushort code = ReadUInt16(remainder, 2);
-        uint transactionId = ReadUInt32(remainder, 4);
-        byte[] body = remainder[8..];
-
-        if (type == PtpContainerTypeResponse)
-        {
-            uint[] responseParameters = ReadPtpUInt32ArrayWithKnownCount(body, body.Length / 4);
-            return new PtpContainer(type, code, transactionId, responseParameters, Array.Empty<byte>());
-        }
-
-        return new PtpContainer(type, code, transactionId, Array.Empty<uint>(), body);
-    }
-
-    private byte[] ReceiveExact(int length)
-    {
-        byte[] buffer = new byte[length];
-        int offset = 0;
-        while (offset < length)
-        {
-            byte[] target = offset == 0 ? buffer : new byte[length - offset];
-            uint received = 0;
-            NativeError.ThrowIfError(
-                NativeMethods.idevice_connection_receive(_connection, target, (uint)target.Length, ref received),
-                "Unable to read PTP data"
-            );
-            if (received == 0)
-            {
-                throw new IOException("PTP receive returned zero bytes.");
-            }
-
-            if (offset == 0)
-            {
-                offset += (int)received;
-                continue;
-            }
-
-            Buffer.BlockCopy(target, 0, buffer, offset, (int)received);
-            offset += (int)received;
-        }
-
-        return buffer;
-    }
-
-    private static uint[] ReadPtpUInt32Array(byte[] payload)
-    {
-        if (payload.Length < 4)
-        {
-            return [];
-        }
-
-        int count = (int)ReadUInt32(payload, 0);
-        if (count <= 0)
-        {
-            return [];
-        }
-
-        return ReadPtpUInt32ArrayWithKnownCount(payload[4..], count);
-    }
-
-    private static uint[] ReadPtpUInt32ArrayWithKnownCount(byte[] payload, int count)
-    {
-        if (count <= 0)
-        {
-            return [];
-        }
-
-        uint[] values = new uint[count];
-        for (int i = 0; i < count; i++)
-        {
-            int offset = i * 4;
-            if (offset + 4 > payload.Length)
-            {
-                break;
-            }
-
-            values[i] = ReadUInt32(payload, offset);
-        }
-
-        return values;
-    }
-
-    private static PtpObjectInfo ParseObjectInfo(byte[] payload)
-    {
-        if (payload.Length < 52)
-        {
-            throw new InvalidOperationException("PTP object info payload was incomplete.");
-        }
-
-        ushort objectFormat = ReadUInt16(payload, 4);
-        uint parentObject = ReadUInt32(payload, 40);
-        int offset = 52;
-        string fileName = ReadPtpString(payload, ref offset);
-        return new PtpObjectInfo(fileName, objectFormat == 0x3001, parentObject);
-    }
-
-    private static string ReadPtpString(byte[] payload, ref int offset)
-    {
-        if (offset >= payload.Length)
-        {
-            return string.Empty;
-        }
-
-        int count = payload[offset++];
-        if (count <= 0)
-        {
-            return string.Empty;
-        }
-
-        int byteLength = count * 2;
-        if (offset + byteLength > payload.Length)
-        {
-            byteLength = Math.Max(0, payload.Length - offset);
-        }
-
-        string value = Encoding.Unicode.GetString(payload, offset, byteLength);
-        offset += byteLength;
-        return value.TrimEnd('\0');
-    }
-
-    private static void WriteUInt16(byte[] buffer, int offset, ushort value)
-    {
-        buffer[offset] = (byte)(value & 0xFF);
-        buffer[offset + 1] = (byte)((value >> 8) & 0xFF);
-    }
-
-    private static void WriteUInt32(byte[] buffer, int offset, uint value)
-    {
-        buffer[offset] = (byte)(value & 0xFF);
-        buffer[offset + 1] = (byte)((value >> 8) & 0xFF);
-        buffer[offset + 2] = (byte)((value >> 16) & 0xFF);
-        buffer[offset + 3] = (byte)((value >> 24) & 0xFF);
-    }
-
-    private static ushort ReadUInt16(byte[] buffer, int offset) => (ushort)(buffer[offset] | (buffer[offset + 1] << 8));
-
-    private static uint ReadUInt32(byte[] buffer, int offset) =>
-        (uint)(buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16) | (buffer[offset + 3] << 24));
-
-    private readonly record struct PtpContainer(ushort Type, ushort Code, uint TransactionId, uint[] Parameters, byte[] Payload);
-}
-
 internal sealed class AfcSession : IDisposable
 {
     private AfcSession(IntPtr device, IntPtr lockdowndClient, IntPtr serviceDescriptor, IntPtr afcClient)
@@ -3005,10 +2131,6 @@ internal enum MediaKind
 
 internal sealed record MediaEnumerationResult(IReadOnlyList<MediaAsset> Assets, string[] ScannedRoots, string Backend, string? BackendNote = null);
 
-internal sealed record PtpMediaObject(uint ObjectHandle, string RemotePath);
-
-internal sealed record PtpObjectInfo(string FileName, bool IsAssociation, uint ParentObject);
-
 internal sealed record MediaAssetView(
     string Id,
     string Name,
@@ -3063,8 +2185,6 @@ internal sealed record RemoteFsListingResponse(string CurrentPath, string? Paren
 
 internal sealed record ErrorResponse(string Message);
 
-internal sealed record PtpStatusResponse(bool IsAvailable, string Message, int? NativeErrorCode, string? Detail, long ProbeDurationMs);
-
 internal sealed record FailedTransferItem(string RemoteFilePath, string? LocalPath, string ErrorMessage);
 
 internal sealed record QueuedTransferItem(
@@ -3088,7 +2208,9 @@ internal sealed record TransferProgressFileView(
     string Status,
     long BytesCopied,
     long? TotalBytes,
-    string? ErrorMessage
+    string? ErrorMessage,
+    double? DurationSeconds,
+    string? FileSizeMB
 );
 
 internal sealed record TransferProgressResponse(
@@ -3097,7 +2219,8 @@ internal sealed record TransferProgressResponse(
     int TotalCount,
     int CompletedCount,
     bool IsComplete,
-    TransferProgressFileView[] Items
+    TransferProgressFileView[] Items,
+    double? OverallDurationSeconds = null
 );
 
 internal sealed class TransferProgressTracker
@@ -3106,12 +2229,15 @@ internal sealed class TransferProgressTracker
     private readonly Dictionary<string, TransferProgressItemState> itemsById;
     private readonly string operationId;
     private readonly string label;
+    private DateTimeOffset? startedAtUtc;
     private DateTimeOffset? completedAtUtc;
 
     public TransferProgressTracker(string operationId, string label, IEnumerable<TransferCopyWorkItem> items)
     {
         this.operationId = operationId;
         this.label = label;
+        this.startedAtUtc = null;
+        this.completedAtUtc = null;
         itemsById = items.ToDictionary(
             item => item.ItemId,
             item => new TransferProgressItemState(item.ItemId, item.DisplayName, item.RemoteFilePath),
@@ -3131,6 +2257,14 @@ internal sealed class TransferProgressTracker
         {
             if (!itemsById.TryGetValue(itemId, out TransferProgressItemState? item)) return;
             item.Status = "running";
+            if (item.StartedAtUtc is null)
+            {
+                item.StartedAtUtc = DateTimeOffset.UtcNow;
+            }
+            if (startedAtUtc is null)
+            {
+                startedAtUtc = DateTimeOffset.UtcNow;
+            }
         }
     }
 
@@ -3158,6 +2292,10 @@ internal sealed class TransferProgressTracker
                 item.BytesCopied = item.TotalBytes.Value;
             }
             item.Status = "succeeded";
+            if (item.CompletedAtUtc is null)
+            {
+                item.CompletedAtUtc = DateTimeOffset.UtcNow;
+            }
         }
     }
 
@@ -3168,6 +2306,10 @@ internal sealed class TransferProgressTracker
             if (!itemsById.TryGetValue(itemId, out TransferProgressItemState? item)) return;
             item.Status = "failed";
             item.ErrorMessage = errorMessage;
+            if (item.CompletedAtUtc is null)
+            {
+                item.CompletedAtUtc = DateTimeOffset.UtcNow;
+            }
         }
     }
 
@@ -3187,25 +2329,59 @@ internal sealed class TransferProgressTracker
         lock (gate)
         {
             TransferProgressFileView[] items = itemsById.Values
-                .Select(item => new TransferProgressFileView(
-                    item.ItemId,
-                    item.Name,
-                    item.RemotePath,
-                    item.Status,
-                    item.BytesCopied,
-                    item.TotalBytes,
-                    item.ErrorMessage
-                ))
+                .Select(item =>
+                {
+                    double? durationSeconds = null;
+                    if (item.StartedAtUtc.HasValue && item.CompletedAtUtc.HasValue)
+                    {
+                        durationSeconds = (item.CompletedAtUtc.Value - item.StartedAtUtc.Value).TotalSeconds;
+                    }
+                    else if (item.StartedAtUtc.HasValue && item.Status == "running")
+                    {
+                        durationSeconds = (DateTimeOffset.UtcNow - item.StartedAtUtc.Value).TotalSeconds;
+                    }
+
+                    string? fileSizeMB = null;
+                    if (item.TotalBytes.HasValue && item.TotalBytes.Value > 0)
+                    {
+                        double mb = item.TotalBytes.Value / (1024.0 * 1024.0);
+                        fileSizeMB = mb < 0.1 ? $"{item.TotalBytes.Value} B" : $"{mb:F1} MB";
+                    }
+
+                    return new TransferProgressFileView(
+                        item.ItemId,
+                        item.Name,
+                        item.RemotePath,
+                        item.Status,
+                        item.BytesCopied,
+                        item.TotalBytes,
+                        item.ErrorMessage,
+                        durationSeconds,
+                        fileSizeMB
+                    );
+                })
                 .ToArray();
             int completedCount = items.Count(item => item.Status is "succeeded" or "failed");
             bool done = completedAtUtc.HasValue && completedCount >= items.Length;
+
+            double? overallDurationSeconds = null;
+            if (startedAtUtc.HasValue && completedAtUtc.HasValue)
+            {
+                overallDurationSeconds = (completedAtUtc.Value - startedAtUtc.Value).TotalSeconds;
+            }
+            else if (startedAtUtc.HasValue && !done)
+            {
+                overallDurationSeconds = (DateTimeOffset.UtcNow - startedAtUtc.Value).TotalSeconds;
+            }
+
             return new TransferProgressResponse(
                 operationId,
                 label,
                 items.Length,
                 completedCount,
                 done,
-                items
+                items,
+                overallDurationSeconds
             );
         }
     }
@@ -3219,6 +2395,8 @@ internal sealed class TransferProgressTracker
             RemotePath = remotePath;
             Status = "pending";
             BytesCopied = 0;
+            StartedAtUtc = null;
+            CompletedAtUtc = null;
         }
 
         public string ItemId { get; }
@@ -3228,6 +2406,8 @@ internal sealed class TransferProgressTracker
         public long BytesCopied { get; set; }
         public long? TotalBytes { get; set; }
         public string? ErrorMessage { get; set; }
+        public DateTimeOffset? StartedAtUtc { get; set; }
+        public DateTimeOffset? CompletedAtUtc { get; set; }
     }
 }
 
@@ -3510,34 +2690,6 @@ internal static class MediaIndexStore
         public bool IsExpired(TimeSpan ttl) => DateTimeOffset.UtcNow - CreatedAtUtc > ttl;
     }
 
-    internal static class PtpFallbackState
-    {
-        private static readonly ConcurrentDictionary<string, DateTimeOffset> PtpUnavailableUntil = new(StringComparer.Ordinal);
-        private static readonly TimeSpan RetryAfter = TimeSpan.FromMinutes(2);
-
-        public static bool ShouldBypassPtp(string? udid)
-        {
-            string deviceKey = GetDeviceKey(udid);
-            if (!PtpUnavailableUntil.TryGetValue(deviceKey, out DateTimeOffset unavailableUntil))
-            {
-                return false;
-            }
-
-            if (unavailableUntil <= DateTimeOffset.UtcNow)
-            {
-                PtpUnavailableUntil.TryRemove(deviceKey, out _);
-                return false;
-            }
-
-            return true;
-        }
-
-        public static void MarkPtpUnavailable(string? udid) => PtpUnavailableUntil[GetDeviceKey(udid)] = DateTimeOffset.UtcNow.Add(RetryAfter);
-
-        public static void Clear(string? udid) => PtpUnavailableUntil.TryRemove(GetDeviceKey(udid), out _);
-
-        private static string GetDeviceKey(string? udid) => string.IsNullOrWhiteSpace(udid) ? "default-device" : udid.Trim();
-    }
 }
 
 internal static class NativeError
@@ -3779,14 +2931,6 @@ internal static class UiPage
       font-size: .98rem;
     }
     .status.error { color: #b63838; }
-    .ptp-status {
-      min-height: 20px;
-      margin: -10px 0 14px;
-      color: var(--muted);
-      font-size: .88rem;
-    }
-    .ptp-status.ok { color: #2b7a3e; }
-    .ptp-status.error { color: #b63838; }
     .transfer-progress-panel {
       background: var(--panel);
       border: 1px solid var(--border);
@@ -4038,6 +3182,18 @@ internal static class UiPage
       background: rgba(20, 30, 58, 0.75);
       color: white;
       font-size: .82rem;
+    }
+    .file-size {
+      position: absolute;
+      right: 12px;
+      bottom: 50px;
+      padding: 4px 8px;
+      background: rgba(20, 30, 58, 0.75);
+      color: white;
+      font-size: .82rem;
+      border-radius: 999px;
+      backdrop-filter: blur(10px);
+      z-index: 2;
     }
     .empty {
       padding: 48px 24px;
@@ -4396,7 +3552,6 @@ internal static class UiPage
           <button id="scanRecacheButton" title="Scan and recache resets media and file-system cache before scanning.">Scan and recache</button>
         </div>
       </div>
-      <button class="hidden" id="retryPtpButton" title="Clear the PTP retry cooldown and scan again using PTP">Retry PTP</button>
       <button id="selectAllButton">Select All</button>
       <button id="deselectAllButton">Deselect All</button>
       <button class="hidden" id="fsSelectAllButton">Select All</button>
@@ -4411,7 +3566,6 @@ internal static class UiPage
 
     <div class="progress-bar" id="progressBar"></div>
     <div class="status" id="status">Choose options and click Scan to start.</div>
-    <div class="ptp-status" id="ptpStatus">PTP status: checking...</div>
     <div class="transfer-progress-panel hidden" id="transferProgressPanel">
       <div class="transfer-progress-summary" id="transferProgressSummary"></div>
       <div class="transfer-progress-list" id="transferProgressList"></div>
@@ -4601,7 +3755,6 @@ internal static class UiPage
       transferProgressSnapshot: null,
       transferProgressOperationId: null,
       transferProgressTimer: null,
-      ptpFallbackActive: false,
       videoPreviewCache: new Map(),
       videoHydrating: new Set(),
       videoHydrationQueue: [],
@@ -4612,7 +3765,6 @@ internal static class UiPage
     const summary = document.getElementById('summary');
     const fsSummary = document.getElementById('fsSummary');
     const status = document.getElementById('status');
-    const ptpStatus = document.getElementById('ptpStatus');
     const progressBar = document.getElementById('progressBar');
     const grid = document.getElementById('grid');
     const fsList = document.getElementById('fsList');
@@ -4628,7 +3780,6 @@ internal static class UiPage
     const scanMenu = document.getElementById('scanMenu');
     const scanCachedButton = document.getElementById('scanCachedButton');
     const scanRecacheButton = document.getElementById('scanRecacheButton');
-    const retryPtpButton = document.getElementById('retryPtpButton');
     const selectAllButton = document.getElementById('selectAllButton');
     const deselectAllButton = document.getElementById('deselectAllButton');
     const fsSelectAllButton = document.getElementById('fsSelectAllButton');
@@ -4672,7 +3823,6 @@ internal static class UiPage
     const transferProgressPanel = document.getElementById('transferProgressPanel');
     const transferProgressSummary = document.getElementById('transferProgressSummary');
     const transferProgressList = document.getElementById('transferProgressList');
-    let ptpStatusTimer = null;
 
     filterInput.addEventListener('change', () => {
       state.filter = filterInput.value;
@@ -4694,7 +3844,6 @@ internal static class UiPage
       closeScanMenu();
       scanAndRecache();
     });
-    retryPtpButton.addEventListener('click', () => retryPtp());
     selectAllButton.addEventListener('click', () => selectAllMedia());
     deselectAllButton.addEventListener('click', () => deselectAllMedia());
     fsSelectAllButton.addEventListener('click', () => selectAllFs());
@@ -4775,7 +3924,6 @@ internal static class UiPage
       scanMenuButton.disabled = value;
       scanCachedButton.disabled = value;
       scanRecacheButton.disabled = value;
-      retryPtpButton.disabled = value;
       selectAllButton.disabled = value;
       deselectAllButton.disabled = value;
       fsSelectAllButton.disabled = value;
@@ -4802,34 +3950,6 @@ internal static class UiPage
       status.classList.toggle('error', isError);
     }
 
-    function setPtpStatus(message, isAvailable) {
-      ptpStatus.textContent = message;
-      ptpStatus.classList.toggle('ok', isAvailable === true);
-      ptpStatus.classList.toggle('error', isAvailable === false);
-    }
-
-    async function refreshPtpStatus() {
-      try {
-        const response = await fetch(`/api/ptp-status?_=${Date.now()}`, { cache: 'no-store' });
-        if (!response.ok) {
-          throw new Error('PTP status endpoint unavailable.');
-        }
-
-        const data = await response.json();
-        const codeNote = data.nativeErrorCode != null ? ` (error ${data.nativeErrorCode})` : '';
-        const detailNote = !data.isAvailable && data.detail ? ` ${data.detail}` : '';
-        const timingNote = data.probeDurationMs != null ? ` [${data.probeDurationMs} ms]` : '';
-        setPtpStatus(
-          data.isAvailable
-            ? `PTP status: Available${timingNote}`
-            : `PTP status: Unavailable${codeNote}${timingNote}.${detailNote}`,
-          Boolean(data.isAvailable)
-        );
-      } catch {
-        setPtpStatus('PTP status: unavailable (status probe failed).', false);
-      }
-    }
-
     function createOperationId() {
       if (window.crypto && typeof window.crypto.randomUUID === 'function') {
         return window.crypto.randomUUID();
@@ -4843,12 +3963,27 @@ internal static class UiPage
       return `Loaded ${state.items.length} items from ${scannedRoots}.${backendNote}`;
     }
 
+    function formatDurationShort(seconds) {
+      if (!Number.isFinite(seconds) || seconds < 0) return '--:--';
+      const total = Math.round(seconds);
+      const mins = Math.floor(total / 60);
+      const secs = total % 60;
+      return `${mins}:${String(secs).padStart(2, '0')}`;
+    }
+
     function statusTextForProgressItem(item) {
       if (item.status === 'failed') return item.errorMessage || 'Failed';
-      if (item.status === 'succeeded') return 'Done';
-      if (item.status === 'running') return item.totalBytes > 0
-        ? `${formatBytes(item.bytesCopied)} / ${formatBytes(item.totalBytes)}`
-        : 'In progress…';
+      if (item.status === 'succeeded') {
+        const durationText = item.durationSeconds ? ` (${formatDurationShort(item.durationSeconds)})` : '';
+        return `Done${durationText}`;
+      }
+      if (item.status === 'running') {
+        const bytesText = item.totalBytes > 0
+          ? `${formatBytes(item.bytesCopied)} / ${formatBytes(item.totalBytes)}`
+          : 'In progress…';
+        const durationText = item.durationSeconds ? ` [${formatDurationShort(item.durationSeconds)}]` : '';
+        return `${bytesText}${durationText}`;
+      }
       return 'Queued';
     }
 
@@ -4916,7 +4051,10 @@ internal static class UiPage
       }
 
       transferProgressPanel.classList.remove('hidden');
-      transferProgressSummary.textContent = `${progress.label}: ${progress.completedCount}/${progress.totalCount} complete`;
+      const durationNote = progress.overallDurationSeconds
+        ? ` - ${formatDurationShort(progress.overallDurationSeconds)} elapsed`
+        : '';
+      transferProgressSummary.textContent = `${progress.label}: ${progress.completedCount}/${progress.totalCount} complete${durationNote}`;
 
       if (!progress.items || progress.items.length === 0) {
         transferProgressList.innerHTML = '<div class="empty">Preparing transfer list…</div>';
@@ -4933,9 +4071,10 @@ internal static class UiPage
           fillClasses.push('indeterminate');
         }
 
+        const sizeNote = item.fileSizeMB ? ` · ${item.fileSizeMB}` : '';
         row.innerHTML = `
           <div class="tp-head">
-            <div class="tp-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</div>
+            <div class="tp-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}${sizeNote}</div>
             <div class="tp-status ${escapeHtml(item.status)}">${escapeHtml(statusTextForProgressItem(item))}</div>
           </div>
           <div class="tp-track">
@@ -5155,7 +4294,6 @@ internal static class UiPage
       fsView.classList.toggle('hidden', !fsMode);
       filterInput.classList.toggle('hidden', fsMode);
       scanDropdown.classList.toggle('hidden', fsMode);
-      retryPtpButton.classList.toggle('hidden', fsMode || !state.ptpFallbackActive);
       selectAllButton.classList.toggle('hidden', fsMode);
       deselectAllButton.classList.toggle('hidden', fsMode);
       fsSelectAllButton.classList.toggle('hidden', !fsMode);
@@ -5259,6 +4397,7 @@ internal static class UiPage
         const completedTooltipAttr = progressItem?.status === 'succeeded' ? ' title="Completed"' : '';
         const badgeMarkup = item.kind === 'live-photo' ? `<div class="badge">${livePhotoIcon}</div>` : '';
         const durationMarkup = item.kind === 'video' ? `<div class="duration">${timerIcon}<span class="dur-text">${cachedVideo?.durationText || '--:--'}</span></div>` : '';
+        const sizeMarkup = progressItem?.fileSizeMB ? `<div class="file-size">${progressItem.fileSizeMB}</div>` : '';
         const progressMarkup = buildMediaCopyProgressMarkup(progressItem);
         const selectorText = selected ? '&#10003;' : '';
         const preview = item.previewMode === 'video'
@@ -5274,6 +4413,7 @@ internal static class UiPage
           ${badgeMarkup}
           <div class="selector">${selectorText}</div>
           ${durationMarkup}
+          ${sizeMarkup}
           ${progressMarkup}
           <div class="card-footer">
             <h2 class="card-title">${escapeHtml(item.name)}</h2>
@@ -5711,8 +4851,6 @@ internal static class UiPage
         state.selected.clear();
         renderSummary();
         renderGrid();
-        state.ptpFallbackActive = Boolean(data.backendNote);
-        retryPtpButton.classList.toggle('hidden', !state.ptpFallbackActive);
         setStatus(buildMediaLoadStatus(data));
       } catch (error) {
         state.items = [];
@@ -5723,14 +4861,6 @@ internal static class UiPage
       } finally {
         setBusy(false);
       }
-    }
-
-    async function retryPtp() {
-      try {
-        await fetch('/api/ptp-retry', { method: 'POST' });
-      } catch { }
-      await loadMedia(true);
-      await refreshPtpStatus();
     }
 
     async function scanAndRecache() {
@@ -5750,12 +4880,9 @@ internal static class UiPage
         renderSummary();
         renderFsList();
         renderFsSummary();
-        state.ptpFallbackActive = false;
-        retryPtpButton.classList.add('hidden');
 
         setBusy(false);
         await loadMedia(true);
-        await refreshPtpStatus();
       } catch (error) {
         setStatus(error.message, true);
         setBusy(false);
@@ -5959,8 +5086,6 @@ internal static class UiPage
     parallelismInput.value = settings.parallelism;
     parallelismValue.textContent = settings.parallelism;
     loadQueue();
-    refreshPtpStatus();
-    ptpStatusTimer = window.setInterval(refreshPtpStatus, 7000);
   </script>
 </body>
 </html>
